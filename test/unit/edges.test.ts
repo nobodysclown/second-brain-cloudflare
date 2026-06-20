@@ -130,16 +130,17 @@ describe("inferEdgesOnWrite", () => {
     env = makeTestEnv(db);
   });
 
-  it("creates relates_to edges to neighbors above the similarity threshold", async () => {
+  it("auto-links only genuinely-related neighbors, not loose keyword-overlap ones", async () => {
     await inferEdgesOnWrite("new", [
-      { id: "a", score: 0.9 },
-      { id: "b", score: 0.6 },
-      { id: "c", score: 0.4 }, // below threshold — excluded
+      { id: "strong", score: 0.84 }, // clearly related — link
+      { id: "loose", score: 0.66 },  // shares a keyword but not really related — must NOT link
+      { id: "weak", score: 0.4 },    // unrelated
     ], env);
-    expect(db.edges).toHaveLength(2);
-    expect(db.edges.every((e: any) => e.type === "relates_to" && e.provenance === "inferred")).toBe(true);
+    expect(db.edges).toHaveLength(1);
     const linked = db.edges.flatMap((e: any) => [e.source_id, e.target_id]).filter((id: string) => id !== "new");
-    expect(linked.sort()).toEqual(["a", "b"]);
+    expect(linked).toEqual(["strong"]);
+    expect(db.edges[0].type).toBe("relates_to");
+    expect(db.edges[0].provenance).toBe("inferred");
   });
 
   it("never links the new entry to itself", async () => {
@@ -159,8 +160,8 @@ describe("inferEdgesOnWrite", () => {
   });
 
   it("uses the similarity score as the edge weight", async () => {
-    await inferEdgesOnWrite("new", [{ id: "a", score: 0.77 }], env);
-    expect(db.edges[0].weight).toBeCloseTo(0.77);
+    await inferEdgesOnWrite("new", [{ id: "a", score: 0.82 }], env);
+    expect(db.edges[0].weight).toBeCloseTo(0.82);
   });
 
   it("writes nothing when there are no qualifying neighbors", async () => {

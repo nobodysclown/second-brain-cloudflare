@@ -465,7 +465,14 @@ export async function buildGraph(opts: { seed?: string; limit?: number }, env: E
 // duplicate/contradiction detection — no extra embed or Vectorize query. Only the
 // strongest few links above a confidence floor are kept so the graph stays sparse;
 // the nightly graph pass later refines and types these.
-const EDGE_INFER_THRESHOLD = 0.55; // min similarity to auto-link
+//
+// Threshold tuned for the bge-small-en-v1.5 embedding model, whose cosine scores are
+// NOT spread across [0,1]: unrelated text lands ~0.4–0.6, mere keyword/concept overlap
+// ~0.6–0.7, genuinely same-topic ~0.78–0.85, near-duplicate ≥0.85. We sit just below
+// the 0.85 smart-merge band so we capture "clearly related but distinct" while
+// rejecting loose overlap (e.g. "espresso filter" vs "Buy Me a Coffee", ~0.65). Lower
+// toward ~0.74 if the graph feels too sparse; raise toward ~0.82 if noise returns.
+const EDGE_INFER_THRESHOLD = 0.78; // min cosine similarity to auto-link (was 0.55 — too loose, linked keyword-overlap noise)
 const EDGE_INFER_MAX = 3;          // max inferred links per new entry
 
 export async function inferEdgesOnWrite(

@@ -47,7 +47,7 @@ describe("auto-link on write (issue #16)", () => {
   it("links a newly-stored entry to a similar existing one (relates_to, inferred)", async () => {
     seedExisting(db);
     const env = makeTestEnv(db, {
-      VECTORIZE: makeVectorizeMock({ query: vi.fn().mockResolvedValue({ matches: [match("existing", 0.7)] }) }),
+      VECTORIZE: makeVectorizeMock({ query: vi.fn().mockResolvedValue({ matches: [match("existing", 0.8)] }) }),
       AI: makeAI('{"contradicts": false}'),
     });
     const { ctx, drain } = makeCtx();
