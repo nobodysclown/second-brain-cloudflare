@@ -110,7 +110,7 @@ describe("auto-link on write (issue #16)", () => {
     expect(db.edges).toHaveLength(0);
   });
 
-  it("DOES link when the new entry wins a contradiction (new-row outcome)", async () => {
+  it("projects a supersedes edge (not a redundant relates_to) when a new entry wins a contradiction", async () => {
     seedExisting(db); // non-canonical incumbent
     const env = makeTestEnv(db, {
       VECTORIZE: makeVectorizeMock({ query: vi.fn().mockResolvedValue({ matches: [match("existing", 0.9)] }) }),
@@ -122,7 +122,12 @@ describe("auto-link on write (issue #16)", () => {
     await drain();
 
     expect(result.status).toBe("contradiction");
+    if (result.status !== "contradiction") throw new Error("expected contradiction");
     expect(db.edges).toHaveLength(1);
-    expect(db.edges[0].type).toBe("relates_to");
+    const e = db.edges[0];
+    expect(e.type).toBe("supersedes"); // new supersedes the deprecated incumbent
+    expect(e.provenance).toBe("system");
+    expect(e.source_id).toBe(result.id);
+    expect(e.target_id).toBe("existing");
   });
 });

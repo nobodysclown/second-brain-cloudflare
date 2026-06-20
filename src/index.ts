@@ -1349,6 +1349,62 @@ async function runNightlyCompression(env: Env, ctx: ExecutionContext): Promise<v
   }
 }
 
+// ─── Nightly graph maintenance (issue #16) ──────────────────────────────────────
+// Bounded, idempotent background pass that keeps the relationship graph healthy:
+// prunes weak stale auto-edges, then backfills links for still-unlinked entries so
+// memories created before linking existed gradually join the graph. Runs on the same
+// daily cron as compression — no new/extra trigger. (A future fast-follow can add an
+// LLM step that promotes generic relates_to edges to specific types from EDGE_TYPES.)
+const GRAPH_PASS_BACKFILL_LIMIT = 25;          // unlinked entries to link per run
+const EDGE_PRUNE_WEIGHT = 0.3;                 // inferred edges weaker than this are prune candidates…
+const EDGE_PRUNE_MIN_AGE_MS = 7 * 24 * 60 * 60 * 1000; // …once they're at least a week old
+
+export async function runGraphPass(env: Env, ctx: ExecutionContext): Promise<void> {
+  await initializeDatabase(env);
+
+  // (1) Prune weak, old, INFERRED edges only — explicit (user) and system (lifecycle)
+  // edges are never auto-removed. That's exactly what `provenance` is for.
+  try {
+    await env.DB.prepare(
+      `DELETE FROM edges WHERE provenance = 'inferred' AND weight < ? AND updated_at < ?`
+    ).bind(EDGE_PRUNE_WEIGHT, Date.now() - EDGE_PRUNE_MIN_AGE_MS).run();
+  } catch (e) {
+    console.error("Graph prune failed (non-fatal):", e);
+  }
+
+  // (2) Backfill: find a bounded batch of entries with no edges yet and link each to
+  // its nearest neighbors (same logic as on-write inference). Empty edges table →
+  // every entry is unlinked → the graph fills in over successive nightly runs.
+  let unlinked: { id: string; content: string }[] = [];
+  try {
+    const { results } = await env.DB.prepare(
+      `SELECT id, content FROM entries
+       WHERE id NOT IN (SELECT source_id FROM edges) AND id NOT IN (SELECT target_id FROM edges)
+         AND tags NOT LIKE '%"status:deprecated"%'
+       ORDER BY created_at DESC LIMIT ${GRAPH_PASS_BACKFILL_LIMIT}`
+    ).all() as { results: { id: string; content: string }[] };
+    unlinked = results;
+  } catch (e) {
+    console.error("Graph backfill query failed (non-fatal):", e);
+  }
+
+  for (const entry of unlinked) {
+    try {
+      const values = await embed(entry.content, env);
+      const { matches } = await env.VECTORIZE.query(values, { topK: 5, returnMetadata: "all" });
+      const scores = new Map<string, number>();
+      for (const m of matches) {
+        const pid = (m.metadata as any)?.parentId ?? m.id;
+        scores.set(pid, Math.max(scores.get(pid) ?? 0, m.score));
+      }
+      const neighbors = [...scores.entries()].map(([id, score]) => ({ id, score }));
+      await inferEdgesOnWrite(entry.id, neighbors, env);
+    } catch (e) {
+      console.error(`Graph backfill failed for ${entry.id} (non-fatal):`, e);
+    }
+  }
+}
+
 // ─── Shared search path ───────────────────────────────────────────────────────
 // Used by both the `recall` MCP tool and GET /recall — the full semantic
 // search pipeline (embed → vector query → time-decay rerank → dedupe → D1
@@ -1771,8 +1827,15 @@ export async function captureEntry(
     } catch (e) {
       console.error("Contradiction deprecation failed (non-fatal):", e);
     }
-    // New entry won the contradiction — it's a real new node, so auto-link it (#16).
-    ctx.waitUntil(inferEdgesOnWrite(id, neighbors, env).catch(e => console.error("Edge inference failed (non-fatal):", e)));
+    // Project the lifecycle into the graph: the new entry supersedes the deprecated
+    // one (#16). Skip a redundant relates_to to the superseded node — the supersedes
+    // edge already captures that relationship — but still auto-link other neighbors.
+    try {
+      await createEdge(id, conflictId, "supersedes", { provenance: "system", weight: 1.0 }, env);
+    } catch (e) {
+      console.error("Supersedes edge creation failed (non-fatal):", e);
+    }
+    ctx.waitUntil(inferEdgesOnWrite(id, neighbors.filter(n => n.id !== conflictId), env).catch(e => console.error("Edge inference failed (non-fatal):", e)));
     return { status: "contradiction", id, resolvedConflict: conflictId, reason: contradiction.reason };
   }
 
@@ -2643,5 +2706,6 @@ export default {
     oauthProvider.fetch(req, env as any, ctx),
   scheduled: async (_event: ScheduledEvent, env: Env, ctx: ExecutionContext) => {
     ctx.waitUntil(runNightlyCompression(env, ctx));
+    ctx.waitUntil(runGraphPass(env, ctx));
   },
 };

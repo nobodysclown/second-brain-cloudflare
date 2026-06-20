@@ -120,6 +120,13 @@ export class D1Mock {
           db.edges = db.edges.filter((e: any) => e.source_id !== sid && e.target_id !== tid);
           return { meta: { changes: before - db.edges.length } };
         }
+        if (s.startsWith("DELETE FROM edges WHERE provenance")) {
+          // runGraphPass prune: inferred edges below a weight, older than a cutoff.
+          const [weight, age] = args;
+          const before = db.edges.length;
+          db.edges = db.edges.filter((e: any) => !(e.provenance === "inferred" && e.weight < weight && e.updated_at < age));
+          return { meta: { changes: before - db.edges.length } };
+        }
         return { meta: {} };
       },
       async first() {
@@ -191,6 +198,22 @@ export class D1Mock {
             .sort((a: any, b: any) => b.created_at - a.created_at)
             .slice(0, limit)
             .map((e: any) => ({ id: e.id, content: e.content, tags: e.tags, source: e.source, created_at: e.created_at }));
+          return { results: rows };
+        }
+        if (s.includes("FROM entries") && s.includes("id NOT IN (SELECT source_id FROM edges)")) {
+          // runGraphPass backfill: entries not referenced by any edge, newest first.
+          const linked = new Set(db.edges.flatMap((e: any) => [e.source_id, e.target_id]));
+          const limitMatch = s.match(/LIMIT (\d+)/);
+          const limit = limitMatch ? parseInt(limitMatch[1], 10) : 25;
+          const rows = [...db.entries]
+            .filter((e: any) => {
+              if (linked.has(e.id)) return false;
+              if (s.includes('"status:deprecated"') && (JSON.parse(e.tags ?? "[]") as string[]).includes("status:deprecated")) return false;
+              return true;
+            })
+            .sort((a: any, b: any) => b.created_at - a.created_at)
+            .slice(0, limit)
+            .map((e: any) => ({ id: e.id, content: e.content }));
           return { results: rows };
         }
         if (s.includes("FROM edges WHERE source_id IN")) {
