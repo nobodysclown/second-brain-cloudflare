@@ -2,6 +2,7 @@ import { COMPRESSION_IMPORTANCE_THRESHOLD, COMPRESSION_MIN_RECALL } from "../../
 
 export class D1Mock {
   entries: any[] = [];
+  edges: any[] = [];
 
   prepare(sql: string) {
     const s = sql.replace(/\s+/g, " ").trim();
@@ -101,6 +102,24 @@ export class D1Mock {
           db.entries = db.entries.filter((e: any) => e.id !== id);
           return { meta: { changes: before - db.entries.length } };
         }
+        if (s.startsWith("INSERT INTO edges")) {
+          const [id, source_id, target_id, type, weight, provenance, metadata, created_at, updated_at] = args;
+          const existing = db.edges.find((e: any) => e.source_id === source_id && e.target_id === target_id && e.type === type);
+          if (existing) {
+            existing.weight = Math.max(existing.weight, weight); // ON CONFLICT ... max(weight)
+            existing.updated_at = updated_at;
+          } else {
+            db.edges.push({ id, source_id, target_id, type, weight, provenance, metadata, created_at, updated_at });
+          }
+          return { meta: { changes: 1 } };
+        }
+        if (s.startsWith("DELETE FROM edges WHERE source_id")) {
+          // Cascade delete on forget: source_id = ? OR target_id = ? (both bound to the same id).
+          const [sid, tid] = args;
+          const before = db.edges.length;
+          db.edges = db.edges.filter((e: any) => e.source_id !== sid && e.target_id !== tid);
+          return { meta: { changes: before - db.edges.length } };
+        }
         return { meta: {} };
       },
       async first() {
@@ -173,6 +192,32 @@ export class D1Mock {
             .slice(0, limit)
             .map((e: any) => ({ id: e.id, content: e.content, tags: e.tags, source: e.source, created_at: e.created_at }));
           return { results: rows };
+        }
+        if (s.includes("FROM edges WHERE source_id IN")) {
+          // expandGraph BFS: every edge touching the frontier, strongest first.
+          // Args are the frontier id list bound twice (source_id IN …, target_id IN …).
+          const ids = new Set(args.map((a: any) => String(a)));
+          const results = db.edges
+            .filter((e: any) => ids.has(e.source_id) || ids.has(e.target_id))
+            .sort((a: any, b: any) => b.weight - a.weight)
+            .map((e: any) => ({ source_id: e.source_id, target_id: e.target_id, type: e.type, weight: e.weight }));
+          return { results };
+        }
+        if (s.includes("SELECT id, tags FROM entries WHERE id IN")) {
+          // expandGraph deprecation check.
+          const results = db.entries
+            .filter((e: any) => args.includes(e.id))
+            .map((e: any) => ({ id: e.id, tags: e.tags }));
+          return { results };
+        }
+        if (s.includes("SELECT id, content, tags, source, created_at FROM entries WHERE id IN") && !s.includes("tags NOT LIKE")) {
+          // Graph node hydration (/connections, /graph). The `tags NOT LIKE` guard
+          // keeps this from shadowing recall's hydration query (same columns, but it
+          // applies the auto-pattern/deprecated/kind filters itself further down).
+          const results = db.entries
+            .filter((e: any) => args.includes(e.id))
+            .map((e: any) => ({ id: e.id, content: e.content, tags: e.tags, source: e.source, created_at: e.created_at }));
+          return { results };
         }
         if (s.includes("SELECT id, recall_count, importance_score") && s.includes("WHERE id IN")) {
           const results = db.entries
@@ -321,5 +366,5 @@ export class D1Mock {
 
   async exec(_sql: string) { }
   async batch(stmts: any[]) { return Promise.all(stmts.map((s: any) => s.run())); }
-  reset() { this.entries = []; }
+  reset() { this.entries = []; this.edges = []; }
 }

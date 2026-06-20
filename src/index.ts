@@ -137,6 +137,231 @@ export function withKind(tags: string[], kind: MemoryKind): string[] {
   return [...cleaned, `${KIND_PREFIX}${kind}`];
 }
 
+// ─── Relationship graph (issue #16) ─────────────────────────────────────────────
+// Edges live in a dedicated `edges` table — the one additive schema change. Edge
+// types and provenance are validated in CODE against this registry rather than via
+// SQL CHECK constraints, so adding a new type is a one-line change here that ships
+// with a deploy and never requires a migration. Per-edge extension data goes in the
+// edges.metadata JSON column (the edges analogue of entries.tags) — also no ALTER.
+
+export const EDGE_TYPES = {
+  relates_to:      { directed: false, label: "Related to",      allowedKinds: null },
+  supersedes:      { directed: true,  label: "Supersedes",      allowedKinds: null },
+  caused_by:       { directed: true,  label: "Caused by",       allowedKinds: null },
+  decided:         { directed: true,  label: "Decided",         allowedKinds: ["episodic"] },
+  about_person:    { directed: true,  label: "About person",    allowedKinds: null },
+  part_of_project: { directed: true,  label: "Part of project", allowedKinds: null },
+  follows:         { directed: true,  label: "Follows",         allowedKinds: ["episodic"] },
+} as const satisfies Record<string, { directed: boolean; label: string; allowedKinds: readonly MemoryKind[] | null }>;
+
+export type EdgeType = keyof typeof EDGE_TYPES;
+
+export const PROVENANCE_VALUES = ["explicit", "inferred", "system"] as const;
+export type EdgeProvenance = (typeof PROVENANCE_VALUES)[number];
+
+const DEFAULT_EDGE_WEIGHT = 0.5;
+
+export function isValidEdgeType(type: string): type is EdgeType {
+  return Object.prototype.hasOwnProperty.call(EDGE_TYPES, type);
+}
+
+// Symmetric (undirected) edges store the pair smaller-id-first so A→B and B→A
+// collapse to one row; directed edges keep their natural order.
+export function isSymmetric(type: EdgeType): boolean {
+  return !EDGE_TYPES[type].directed;
+}
+
+export function edgeLabel(type: EdgeType): string {
+  return EDGE_TYPES[type].label;
+}
+
+export function allowedKindsFor(type: EdgeType): readonly MemoryKind[] | null {
+  return EDGE_TYPES[type].allowedKinds;
+}
+
+// The single writer for edges. Rejects self-links and unknown types (returns null),
+// normalizes symmetric pairs, and upserts idempotently so re-linking the same pair
+// keeps the stronger weight instead of erroring or duplicating.
+export async function createEdge(
+  sourceId: string,
+  targetId: string,
+  type: string,
+  opts: { weight?: number; provenance?: EdgeProvenance; metadata?: Record<string, unknown> },
+  env: Env,
+): Promise<{ source_id: string; target_id: string; type: EdgeType } | null> {
+  if (!isValidEdgeType(type)) return null;
+  if (sourceId === targetId) return null;
+
+  let source = sourceId;
+  let target = targetId;
+  if (isSymmetric(type) && source > target) [source, target] = [target, source];
+
+  const weight = Math.max(0, Math.min(1, opts.weight ?? DEFAULT_EDGE_WEIGHT));
+  const provenance = opts.provenance ?? "inferred";
+  const metadata = JSON.stringify(opts.metadata ?? {});
+  const now = Date.now();
+
+  await env.DB.prepare(
+    `INSERT INTO edges (id, source_id, target_id, type, weight, provenance, metadata, created_at, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+     ON CONFLICT(source_id, target_id, type) DO UPDATE SET weight = max(weight, excluded.weight), updated_at = excluded.updated_at`
+  ).bind(crypto.randomUUID(), source, target, type, weight, provenance, metadata, now, now).run();
+
+  return { source_id: source, target_id: target, type };
+}
+
+// ─── Graph traversal ────────────────────────────────────────────────────────────
+
+const GRAPH_MAX_HOPS = 3;
+const GRAPH_FANOUT_CAP = 8;   // max edges followed per node per hop (strongest first)
+const GRAPH_MAX_NODES = 50;   // cap on total expanded nodes — bounds hub-node blowup
+const GRAPH_HOP_DECAY = 0.6;  // score multiplier per hop of graph distance (multi-hop recall)
+// Each id binds twice per BFS query (source_id IN … OR target_id IN …), so batch
+// well under the 100-bound-param limit.
+const EDGE_QUERY_BATCH = Math.floor(D1_MAX_BOUND_PARAMS / 2);
+
+export interface GraphNeighbor {
+  id: string;
+  hop: number;
+  viaWeight: number;
+  viaType: EdgeType;
+}
+
+// Returns the subset of `ids` whose entry is tagged status:deprecated.
+async function deprecatedIdsAmong(ids: string[], env: Env): Promise<Set<string>> {
+  const deprecated = new Set<string>();
+  for (let i = 0; i < ids.length; i += D1_MAX_BOUND_PARAMS) {
+    const batch = ids.slice(i, i + D1_MAX_BOUND_PARAMS);
+    const ph = batch.map(() => "?").join(", ");
+    const { results } = await env.DB.prepare(
+      `SELECT id, tags FROM entries WHERE id IN (${ph})`
+    ).bind(...batch).all() as { results: Record<string, any>[] };
+    for (const r of results) {
+      if (getStatus(JSON.parse(r.tags ?? "[]")) === "deprecated") deprecated.add(r.id as string);
+    }
+  }
+  return deprecated;
+}
+
+// Breadth-first traversal of the edges table outward from a set of seed nodes.
+// Shared by recall (multi-hop expansion), GET /connections, and GET /graph. Bounded
+// by hop/fanout/node caps so a heavily-connected node can't explode the query, and
+// skips status:deprecated nodes by default so stale entries aren't traversed through.
+export async function expandGraph(
+  seedIds: string[],
+  opts: { hops: number; fanoutCap?: number; maxNodes?: number; includeDeprecated?: boolean },
+  env: Env,
+): Promise<GraphNeighbor[]> {
+  const hops = Math.max(0, Math.min(GRAPH_MAX_HOPS, opts.hops));
+  if (hops === 0 || seedIds.length === 0) return [];
+  const fanoutCap = opts.fanoutCap ?? GRAPH_FANOUT_CAP;
+  const maxNodes = opts.maxNodes ?? GRAPH_MAX_NODES;
+
+  const visited = new Set(seedIds);
+  const out: GraphNeighbor[] = [];
+  let frontier = [...seedIds];
+
+  for (let hop = 1; hop <= hops && frontier.length && out.length < maxNodes; hop++) {
+    // Pull every edge touching the current frontier, strongest first (batched).
+    const edgeRows: { source_id: string; target_id: string; type: string; weight: number }[] = [];
+    for (let i = 0; i < frontier.length; i += EDGE_QUERY_BATCH) {
+      const batch = frontier.slice(i, i + EDGE_QUERY_BATCH);
+      const ph = batch.map(() => "?").join(", ");
+      const { results } = await env.DB.prepare(
+        `SELECT source_id, target_id, type, weight FROM edges WHERE source_id IN (${ph}) OR target_id IN (${ph}) ORDER BY weight DESC`
+      ).bind(...batch, ...batch).all() as { results: any[] };
+      edgeRows.push(...results);
+    }
+
+    // For each frontier node, take its strongest unseen neighbors up to the fanout cap.
+    const frontierSet = new Set(frontier);
+    const perNodeCount = new Map<string, number>();
+    const candidates: GraphNeighbor[] = [];
+    for (const e of edgeRows) {
+      let from: string | null = null;
+      let to: string | null = null;
+      if (frontierSet.has(e.source_id)) { from = e.source_id; to = e.target_id; }
+      else if (frontierSet.has(e.target_id)) { from = e.target_id; to = e.source_id; }
+      if (!from || !to || visited.has(to)) continue;
+      const n = perNodeCount.get(from) ?? 0;
+      if (n >= fanoutCap) continue;
+      perNodeCount.set(from, n + 1);
+      candidates.push({ id: to, hop, viaWeight: e.weight, viaType: e.type as EdgeType });
+    }
+
+    // Drop deprecated nodes before they enter results or the next frontier.
+    let allowed = candidates;
+    if (!opts.includeDeprecated && candidates.length) {
+      const deprecated = await deprecatedIdsAmong([...new Set(candidates.map(c => c.id))], env);
+      allowed = candidates.filter(c => !deprecated.has(c.id));
+    }
+
+    const nextFrontier: string[] = [];
+    for (const c of allowed) {
+      if (visited.has(c.id)) continue; // first (strongest) wins; dedupe across this hop
+      if (out.length >= maxNodes) break;
+      visited.add(c.id);
+      out.push(c);
+      nextFrontier.push(c.id);
+    }
+    frontier = nextFrontier;
+  }
+
+  return out;
+}
+
+// Hydrate graph node ids into full entry rows (id → row), batched within the D1
+// bound-param limit. Shared by /connections and /graph.
+async function hydrateGraphEntries(ids: string[], env: Env): Promise<Map<string, Record<string, any>>> {
+  const map = new Map<string, Record<string, any>>();
+  for (let i = 0; i < ids.length; i += D1_MAX_BOUND_PARAMS) {
+    const batch = ids.slice(i, i + D1_MAX_BOUND_PARAMS);
+    const ph = batch.map(() => "?").join(", ");
+    const { results } = await env.DB.prepare(
+      `SELECT id, content, tags, source, created_at FROM entries WHERE id IN (${ph})`
+    ).bind(...batch).all() as { results: Record<string, any>[] };
+    for (const r of results) map.set(r.id as string, r);
+  }
+  return map;
+}
+
+export interface Connection {
+  id: string;
+  content: string;
+  tags: string[];
+  source: string;
+  created_at: number;
+  type: EdgeType;
+  label: string;
+  weight: number;
+}
+
+// 1-hop neighborhood of an entry, hydrated and annotated with edge type/weight.
+// Backs both the `connections` MCP tool and GET /connections.
+export async function getConnections(id: string, type: string | undefined, env: Env): Promise<Connection[]> {
+  let neighbors = await expandGraph([id], { hops: 1 }, env);
+  if (type) neighbors = neighbors.filter(n => n.viaType === type);
+  if (!neighbors.length) return [];
+
+  const rows = await hydrateGraphEntries(neighbors.map(n => n.id), env);
+  const out: Connection[] = [];
+  for (const n of neighbors) {
+    const row = rows.get(n.id);
+    if (!row) continue; // neighbor was deleted (cascade should prevent this) — skip dangling
+    out.push({
+      id: n.id,
+      content: row.content as string,
+      tags: JSON.parse(row.tags ?? "[]"),
+      source: row.source as string,
+      created_at: row.created_at as number,
+      type: n.viaType,
+      label: edgeLabel(n.viaType),
+      weight: n.viaWeight,
+    });
+  }
+  return out;
+}
+
 // ─── Runtime state ────────────────────────────────────────────────────────────
 
 let dbReady = false;
@@ -248,6 +473,13 @@ async function initializeDatabase(env: Env): Promise<void> {
     await env.DB.exec(`CREATE TABLE IF NOT EXISTS entries (id TEXT PRIMARY KEY, content TEXT NOT NULL, tags TEXT NOT NULL DEFAULT '[]', source TEXT NOT NULL DEFAULT 'api', created_at INTEGER NOT NULL, vector_ids TEXT NOT NULL DEFAULT '[]')`);
     await env.DB.exec(`CREATE INDEX IF NOT EXISTS idx_entries_created_at ON entries(created_at DESC)`);
     await env.DB.exec(`CREATE INDEX IF NOT EXISTS idx_entries_source ON entries(source)`);
+    // Relationship graph (issue #16). One additive table — never touches existing
+    // rows/queries, so old code ignores it and rollback is a no-op. Designed to never
+    // need an ALTER: type/provenance are free TEXT validated in code, and metadata is
+    // a JSON escape-hatch for any future per-edge attribute.
+    await env.DB.exec(`CREATE TABLE IF NOT EXISTS edges (id TEXT PRIMARY KEY, source_id TEXT NOT NULL, target_id TEXT NOT NULL, type TEXT NOT NULL DEFAULT 'relates_to', weight REAL NOT NULL DEFAULT 0.5, provenance TEXT NOT NULL DEFAULT 'inferred', metadata TEXT NOT NULL DEFAULT '{}', created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, UNIQUE(source_id, target_id, type))`);
+    await env.DB.exec(`CREATE INDEX IF NOT EXISTS idx_edges_source ON edges(source_id)`);
+    await env.DB.exec(`CREATE INDEX IF NOT EXISTS idx_edges_target ON edges(target_id)`);
   } catch (e) {
     console.error("Database initialization error (non-fatal):", e);
   }
@@ -1535,6 +1767,15 @@ export async function forgetEntry(id: string, env: Env): Promise<ForgetResult> {
 
   await env.DB.prepare(`DELETE FROM entries WHERE id = ?`).bind(id).run();
 
+  // Cascade: drop any edges touching this node (as source or target) so the graph
+  // never holds links pointing at a deleted entry. Non-fatal — a failed cleanup
+  // must not abort the delete.
+  try {
+    await env.DB.prepare(`DELETE FROM edges WHERE source_id = ? OR target_id = ?`).bind(id, id).run();
+  } catch (e) {
+    console.error("Edge cascade-delete failed (non-fatal):", e);
+  }
+
   try {
     if (vectorIds.length) {
       // Delete exact IDs — no guessing, no leaks
@@ -1823,6 +2064,46 @@ function buildMcpServer(env: Env, ctx: ExecutionContext): McpServer {
         return { content: [{ type: "text", text: `No entry found with ID: ${id}` }] };
       }
       return { content: [{ type: "text", text: `Deleted entry ${id} and ${result.vectorCount} vector(s)` }] };
+    }
+  );
+
+  // ── link ─────────────────────────────────────────────────────────────────
+  server.registerTool(
+    "link",
+    {
+      description: "Create an explicit relationship link between two memories by ID (e.g. connect a decision to its outcome). Get the IDs from recall or list_recent first.",
+      inputSchema: {
+        source_id: z.string().describe("Source entry ID"),
+        target_id: z.string().describe("Target entry ID"),
+        type: z.enum(Object.keys(EDGE_TYPES) as [string, ...string[]]).default("relates_to").describe("Relationship type"),
+      },
+    },
+    async ({ source_id, target_id, type }) => {
+      const edge = await createEdge(source_id, target_id, type, { provenance: "explicit", weight: 1.0 }, env);
+      if (!edge) return { content: [{ type: "text", text: "Cannot link an entry to itself." }] };
+      return { content: [{ type: "text", text: `Linked ${edge.source_id} → ${edge.target_id} (${edgeLabel(edge.type)}).` }] };
+    }
+  );
+
+  // ── connections ──────────────────────────────────────────────────────────
+  server.registerTool(
+    "connections",
+    {
+      description: "List the memories directly linked to a given entry (its 1-hop neighbors in the relationship graph). Get the entry ID from recall or list_recent first.",
+      inputSchema: {
+        id: z.string().describe("Entry ID from recall or list_recent"),
+        type: z.enum(Object.keys(EDGE_TYPES) as [string, ...string[]]).optional().describe("Filter to a single relationship type"),
+      },
+    },
+    async ({ id, type }) => {
+      const connections = await getConnections(id, type, env);
+      if (!connections.length) {
+        return { content: [{ type: "text", text: `No connections found for ${id}.` }] };
+      }
+      const text = connections
+        .map(c => `- (${c.label}) ${c.id}: ${c.content.slice(0, 120)}`)
+        .join("\n");
+      return { content: [{ type: "text", text }] };
     }
   );
 
@@ -2152,6 +2433,39 @@ const defaultHandler = {
       }
 
       return json({ ok: true, id, deletedVectors: result.vectorCount });
+    }
+
+    // POST /link — create an explicit edge between two memories, mirrors the MCP `link` tool
+    if (url.pathname === "/link" && request.method === "POST") {
+      const authErr = requireAuth(request, env);
+      if (authErr) return authErr;
+
+      let body: { source_id?: string; target_id?: string; type?: string };
+      try { body = await request.json(); } catch { return json({ ok: false, error: "Invalid JSON" }, 400); }
+      const sourceId = body.source_id?.trim();
+      const targetId = body.target_id?.trim();
+      if (!sourceId || !targetId) return json({ ok: false, error: "source_id and target_id are required" }, 400);
+      const type = body.type?.trim() || "relates_to";
+      if (!isValidEdgeType(type)) {
+        return json({ ok: false, error: `type must be one of: ${Object.keys(EDGE_TYPES).join(", ")}` }, 400);
+      }
+
+      const edge = await createEdge(sourceId, targetId, type, { provenance: "explicit", weight: 1.0 }, env);
+      if (!edge) return json({ ok: false, error: "Cannot link an entry to itself" }, 400);
+      return json({ ok: true, source_id: edge.source_id, target_id: edge.target_id, type: edge.type });
+    }
+
+    // GET /connections — 1-hop neighbors of an entry, mirrors the MCP `connections` tool
+    if (url.pathname === "/connections" && request.method === "GET") {
+      const authErr = requireAuth(request, env);
+      if (authErr) return authErr;
+
+      const id = url.searchParams.get("id")?.trim();
+      if (!id) return json({ ok: false, error: "id is required" }, 400);
+      const type = url.searchParams.get("type")?.trim() || undefined;
+
+      const connections = await getConnections(id, type, env);
+      return json({ ok: true, id, connections });
     }
 
     // POST /status — set lifecycle status, mirrors the MCP `set_status` tool
