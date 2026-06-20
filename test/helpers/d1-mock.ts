@@ -216,14 +216,31 @@ export class D1Mock {
             .map((e: any) => ({ id: e.id, content: e.content }));
           return { results: rows };
         }
-        if (s.includes("FROM edges WHERE source_id IN")) {
-          // expandGraph BFS: every edge touching the frontier, strongest first.
-          // Args are the frontier id list bound twice (source_id IN …, target_id IN …).
+        if (s.includes("FROM edges WHERE source_id IN") && s.includes("OR target_id IN")) {
+          // expandGraph BFS / graph edge fetch: every edge touching the frontier, strongest
+          // first. Args are the frontier id list bound twice (source_id IN …, target_id IN …).
           const ids = new Set(args.map((a: any) => String(a)));
           const results = db.edges
             .filter((e: any) => ids.has(e.source_id) || ids.has(e.target_id))
             .sort((a: any, b: any) => b.weight - a.weight)
             .map((e: any) => ({ source_id: e.source_id, target_id: e.target_id, type: e.type, weight: e.weight }));
+          return { results };
+        }
+        if (s.includes("SELECT source_id, target_id FROM edges ORDER BY weight DESC")) {
+          // buildGraph default mode: strongest edges first (to derive the node set).
+          const limitMatch = s.match(/LIMIT (\d+)/);
+          const limit = limitMatch ? parseInt(limitMatch[1], 10) : db.edges.length;
+          const results = [...db.edges]
+            .sort((a: any, b: any) => b.weight - a.weight)
+            .slice(0, limit)
+            .map((e: any) => ({ source_id: e.source_id, target_id: e.target_id }));
+          return { results };
+        }
+        if (s.includes("SELECT id, content, tags, importance_score, created_at FROM entries WHERE id IN")) {
+          // buildGraph node hydration.
+          const results = db.entries
+            .filter((e: any) => args.includes(e.id))
+            .map((e: any) => ({ id: e.id, content: e.content, tags: e.tags, importance_score: e.importance_score ?? 0, created_at: e.created_at }));
           return { results };
         }
         if (s.includes("SELECT id, tags FROM entries WHERE id IN")) {

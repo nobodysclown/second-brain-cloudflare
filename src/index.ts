@@ -362,6 +362,104 @@ export async function getConnections(id: string, type: string | undefined, env: 
   return out;
 }
 
+export interface GraphNode {
+  id: string;
+  label: string;
+  tags: string[];
+  kind: MemoryKind | null;
+  status: MemoryStatus | null;
+  importance: number;
+  created_at: number;
+}
+
+export interface GraphView {
+  nodes: GraphNode[];
+  edges: { source: string; target: string; type: string; weight: number }[];
+}
+
+const GRAPH_VIEW_MAX_NODES = 200;
+
+// Assemble a node+edge subgraph for the dashboard graph view. Either the 2-hop
+// neighborhood of a seed entry, or (default) the most strongly-connected slice of the
+// whole graph. Only edges whose BOTH endpoints are in the returned node set are
+// included, so the client never has to handle dangling edges.
+export async function buildGraph(opts: { seed?: string; limit?: number }, env: Env): Promise<GraphView> {
+  const limit = Math.min(Math.max(opts.limit ?? GRAPH_VIEW_MAX_NODES, 1), GRAPH_VIEW_MAX_NODES);
+
+  // 1. Determine the candidate node id set.
+  let nodeIds: string[];
+  if (opts.seed) {
+    const neighbors = await expandGraph([opts.seed], { hops: 2, maxNodes: limit, includeDeprecated: true }, env);
+    nodeIds = [opts.seed, ...neighbors.map(n => n.id)].slice(0, limit);
+  } else {
+    const { results } = await env.DB.prepare(
+      `SELECT source_id, target_id FROM edges ORDER BY weight DESC LIMIT ${limit * 4}`
+    ).all() as { results: { source_id: string; target_id: string }[] };
+    const ids: string[] = [];
+    const seenIds = new Set<string>();
+    for (const r of results) {
+      for (const id of [r.source_id, r.target_id]) {
+        if (ids.length >= limit) break;
+        if (!seenIds.has(id)) { seenIds.add(id); ids.push(id); }
+      }
+      if (ids.length >= limit) break;
+    }
+    nodeIds = ids;
+  }
+  if (!nodeIds.length) return { nodes: [], edges: [] };
+
+  // 2. Hydrate nodes (drop ids with no entry row — that's how dangling edges get pruned).
+  const nodeRows = new Map<string, Record<string, any>>();
+  for (let i = 0; i < nodeIds.length; i += D1_MAX_BOUND_PARAMS) {
+    const batch = nodeIds.slice(i, i + D1_MAX_BOUND_PARAMS);
+    const ph = batch.map(() => "?").join(", ");
+    const { results } = await env.DB.prepare(
+      `SELECT id, content, tags, importance_score, created_at FROM entries WHERE id IN (${ph})`
+    ).bind(...batch).all() as { results: Record<string, any>[] };
+    for (const r of results) nodeRows.set(r.id as string, r);
+  }
+
+  const nodes: GraphNode[] = [];
+  for (const id of nodeIds) {
+    const r = nodeRows.get(id);
+    if (!r) continue;
+    const tags: string[] = JSON.parse(r.tags ?? "[]");
+    nodes.push({
+      id,
+      label: (r.content as string).slice(0, 80),
+      tags,
+      kind: getKind(tags),
+      status: getStatus(tags),
+      importance: (r.importance_score as number) ?? 0,
+      created_at: r.created_at as number,
+    });
+  }
+  const nodeIdSet = new Set(nodes.map(n => n.id));
+  if (!nodeIdSet.size) return { nodes: [], edges: [] };
+
+  // 3. Edges with BOTH endpoints present. Fetch edges touching the node set (chunked,
+  // 2 binds/id), then keep only the internal ones — never a dangling edge.
+  const presentIds = [...nodeIdSet];
+  const edgeSeen = new Set<string>();
+  const edges: GraphView["edges"] = [];
+  for (let i = 0; i < presentIds.length; i += EDGE_QUERY_BATCH) {
+    const batch = presentIds.slice(i, i + EDGE_QUERY_BATCH);
+    const ph = batch.map(() => "?").join(", ");
+    const { results } = await env.DB.prepare(
+      `SELECT source_id, target_id, type, weight FROM edges WHERE source_id IN (${ph}) OR target_id IN (${ph}) ORDER BY weight DESC`
+    ).bind(...batch, ...batch).all() as { results: any[] };
+    for (const e of results) {
+      if (!nodeIdSet.has(e.source_id) || !nodeIdSet.has(e.target_id)) continue;
+      const key = `${e.source_id}|${e.target_id}|${e.type}`;
+      if (edgeSeen.has(key)) continue;
+      edgeSeen.add(key);
+      edges.push({ source: e.source_id, target: e.target_id, type: e.type, weight: e.weight });
+    }
+  }
+
+  return { nodes, edges };
+}
+
 // Auto-link a freshly-stored entry to its most-similar existing neighbors with
 // inferred `relates_to` edges. Reuses the similarity scores already computed during
 // duplicate/contradiction detection — no extra embed or Vectorize query. Only the
@@ -2615,6 +2713,20 @@ const defaultHandler = {
 
       const connections = await getConnections(id, type, env);
       return json({ ok: true, id, connections });
+    }
+
+    // GET /graph — node+edge subgraph for the dashboard graph view (dashboard-only;
+    // no MCP twin — this is visualization data, not an agent capability)
+    if (url.pathname === "/graph" && request.method === "GET") {
+      const authErr = requireAuth(request, env);
+      if (authErr) return authErr;
+
+      const seed = url.searchParams.get("seed")?.trim() || undefined;
+      const limitParam = url.searchParams.get("limit");
+      const limit = limitParam ? parseInt(limitParam, 10) : undefined;
+
+      const { nodes, edges } = await buildGraph({ seed, limit }, env);
+      return json({ ok: true, nodes, edges });
     }
 
     // POST /status — set lifecycle status, mirrors the MCP `set_status` tool

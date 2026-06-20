@@ -2297,6 +2297,7 @@
           <button class="sb-tab active" id="sb-tab-recall" onclick="switchTab('recall')"><i class="ti ti-search"></i><span>Recall</span></button>
           <button class="sb-tab" id="sb-tab-recent" onclick="switchTab('recent')"><i class="ti ti-clock"></i><span>Recent</span></button>
           <button class="sb-tab" id="sb-tab-remember" onclick="switchTab('remember')"><i class="ti ti-plus"></i><span>Remember</span></button>
+          <button class="sb-tab" id="sb-tab-graph" onclick="switchTab('graph')"><i class="ti ti-affiliate"></i><span>Graph</span></button>
         </nav>
         <div class="sb-footer">
           <button class="sb-footer-btn" onclick="openMenu()"><i class="ti ti-settings"></i><span>Settings</span></button>
@@ -2405,12 +2406,22 @@
               </div>
             </div>
           </div>
+
+          <div class="screen" id="screen-graph">
+            <div class="graph-toolbar">
+              <span class="graph-hint">Your memories and how they connect. Tap a node to open it.</span>
+              <button class="graph-refresh" onclick="loadGraph()" title="Refresh"><i class="ti ti-refresh"></i></button>
+            </div>
+            <canvas id="graph-canvas"></canvas>
+            <div class="graph-empty" id="graph-empty" style="display:none">No connections yet — link memories, or let them auto-connect as you add more.</div>
+          </div>
         </div>
 
         <div id="navbar">
           <button class="nav-tab active" id="tab-recall" onclick="switchTab('recall')"><i class="ti ti-search"></i><span>Recall</span></button>
           <button class="nav-tab" id="tab-recent" onclick="switchTab('recent')"><i class="ti ti-clock"></i><span>Recent</span></button>
           <button class="nav-tab" id="tab-remember" onclick="switchTab('remember')"><i class="ti ti-plus"></i><span>Remember</span></button>
+          <button class="nav-tab" id="tab-graph" onclick="switchTab('graph')"><i class="ti ti-affiliate"></i><span>Graph</span></button>
         </div>
       </div>
     </div>
@@ -2455,6 +2466,21 @@
       </div>
     </div>
 
+    <style>
+      #screen-graph { padding: 0; }
+      #screen-graph.active { display: flex; flex-direction: column; }
+      .graph-toolbar { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 12px 16px; border-bottom: 1px solid var(--border-input); }
+      .graph-hint { font-size: 12px; color: var(--text-tertiary); }
+      .graph-refresh { background: none; border: none; color: var(--text-secondary); cursor: pointer; font-size: 16px; padding: 4px; }
+      #graph-canvas { flex: 1 1 auto; width: 100%; min-height: 320px; display: block; touch-action: none; }
+      .graph-empty { padding: 48px 24px; text-align: center; color: var(--text-tertiary); font-size: 14px; }
+      .view-related { margin-top: 14px; border-top: 1px solid var(--border-input); padding-top: 12px; }
+      .view-related-label { font-size: 11px; font-weight: 600; color: var(--text-tertiary); text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 8px; }
+      .related-item { display: block; width: 100%; text-align: left; background: var(--accent-soft); border: none; border-radius: 8px; padding: 8px 10px; margin-bottom: 6px; cursor: pointer; font-size: 13px; line-height: 1.35; color: var(--text-primary); font-family: inherit; }
+      .related-item:hover { background: rgba(178, 102, 65, 0.16); }
+      .related-type { font-weight: 600; color: var(--accent); margin-right: 6px; }
+    </style>
+
     <div id="view-sheet">
       <div class="view-inner">
         <div class="view-header">
@@ -2463,6 +2489,7 @@
         </div>
         <div class="view-content" id="view-content-text"></div>
         <div class="view-tags" id="view-tags-container"></div>
+        <div class="view-related" id="view-related" style="display:none"></div>
         <div class="view-actions">
           <button class="btn-view-append" id="view-btn-append"><i class="ti ti-writing"></i> Append</button>
           <button class="btn-view-edit" id="view-btn-edit"><i class="ti ti-pencil"></i> Edit</button>
@@ -2670,6 +2697,7 @@
         const sbTab = document.getElementById('sb-tab-' + tab)
         if (sbTab) sbTab.classList.add('active')
         if (tab === 'recent') loadRecent()
+        if (tab === 'graph') loadGraph()
       }
 
       async function updateStatus() {
@@ -3314,6 +3342,10 @@
         if (entry.tags && entry.tags.length > 0) {
           tagsContainer.innerHTML = entry.tags.map((t) => `<span class="tag-chip">${escHtml(t)}</span>`).join('')
         }
+        const relatedEl = document.getElementById('view-related')
+        relatedEl.style.display = 'none'
+        relatedEl.innerHTML = ''
+        if (entry.id) loadRelated(entry.id, relatedEl)
         const appendBtn = document.getElementById('view-btn-append')
         if (entry.id) {
           appendBtn.onclick = () => {
@@ -3350,6 +3382,164 @@
       }
       function closeView() {
         document.getElementById('view-sheet').classList.remove('open')
+      }
+
+      // ── Related memories (issue #16) ──────────────────────────────────────────
+      async function loadRelated(id, el) {
+        try {
+          const res = await fetch(`${WORKER_URL}/connections?id=${encodeURIComponent(id)}`, {
+            headers: { Authorization: `Bearer ${AUTH_TOKEN}` },
+          })
+          const data = await res.json()
+          if (!data.ok || !data.connections || !data.connections.length) return
+          el.innerHTML =
+            `<div class="view-related-label">Related</div>` +
+            data.connections
+              .map(
+                (c) =>
+                  `<button class="related-item" data-id="${escHtml(c.id)}"><span class="related-type">${escHtml(c.label)}</span>${escHtml((c.content || '').slice(0, 80))}</button>`
+              )
+              .join('')
+          el.style.display = 'block'
+          el.querySelectorAll('.related-item').forEach((btn) => {
+            btn.onclick = () => {
+              const c = data.connections.find((x) => x.id === btn.dataset.id)
+              if (c) openView({ id: c.id, content: c.content, tags: c.tags }, null)
+            }
+          })
+        } catch {}
+      }
+
+      // ── Force-directed graph view (issue #16) ─────────────────────────────────
+      let graphState = null
+
+      async function loadGraph() {
+        const canvas = document.getElementById('graph-canvas')
+        const emptyEl = document.getElementById('graph-empty')
+        if (!canvas) return
+        try {
+          const res = await fetch(`${WORKER_URL}/graph`, { headers: { Authorization: `Bearer ${AUTH_TOKEN}` } })
+          const data = await res.json()
+          if (!data.ok || !data.nodes || !data.nodes.length) {
+            if (graphState) { cancelAnimationFrame(graphState.raf); graphState = null }
+            canvas.style.display = 'none'
+            emptyEl.style.display = 'block'
+            return
+          }
+          emptyEl.style.display = 'none'
+          canvas.style.display = 'block'
+          initGraphSim(canvas, data.nodes, data.edges)
+        } catch (e) {
+          emptyEl.textContent = 'Could not load the graph.'
+          emptyEl.style.display = 'block'
+        }
+      }
+
+      function graphNodeColor(n) {
+        if (n.kind === 'semantic') return '#b26641'
+        if (n.kind === 'episodic') return '#4a7c8c'
+        return '#9a958a'
+      }
+
+      function initGraphSim(canvas, nodes, edges) {
+        if (graphState) cancelAnimationFrame(graphState.raf)
+        const dpr = window.devicePixelRatio || 1
+        const rect = canvas.getBoundingClientRect()
+        const W = rect.width || 600
+        const H = rect.height || 420
+        canvas.width = W * dpr
+        canvas.height = H * dpr
+        const ctx = canvas.getContext('2d')
+        ctx.scale(dpr, dpr)
+
+        const byId = {}
+        nodes.forEach((n, i) => {
+          n.x = W / 2 + Math.cos(i) * (60 + (i % 6) * 18)
+          n.y = H / 2 + Math.sin(i) * (60 + (i % 5) * 18)
+          n.vx = 0
+          n.vy = 0
+          byId[n.id] = n
+        })
+        const links = edges.map((e) => ({ s: byId[e.source], t: byId[e.target], w: e.weight })).filter((l) => l.s && l.t)
+
+        const state = { raf: 0, ticks: 0 }
+        graphState = state
+
+        canvas.onclick = (ev) => {
+          const r = canvas.getBoundingClientRect()
+          const mx = ev.clientX - r.left
+          const my = ev.clientY - r.top
+          let best = null
+          let bestD = 20 * 20
+          for (const n of nodes) {
+            const dx = n.x - mx
+            const dy = n.y - my
+            const d = dx * dx + dy * dy
+            if (d < bestD) { bestD = d; best = n }
+          }
+          if (best) openView({ id: best.id, content: best.label, tags: best.tags }, null)
+        }
+
+        function tick() {
+          for (let i = 0; i < nodes.length; i++) {
+            const a = nodes[i]
+            for (let j = i + 1; j < nodes.length; j++) {
+              const b = nodes[j]
+              let dx = a.x - b.x
+              let dy = a.y - b.y
+              let d2 = dx * dx + dy * dy || 0.01
+              const d = Math.sqrt(d2)
+              const f = 1400 / d2
+              const fx = (dx / d) * f
+              const fy = (dy / d) * f
+              a.vx += fx; a.vy += fy; b.vx -= fx; b.vy -= fy
+            }
+          }
+          for (const l of links) {
+            let dx = l.t.x - l.s.x
+            let dy = l.t.y - l.s.y
+            const d = Math.sqrt(dx * dx + dy * dy) || 0.01
+            const f = (d - 72) * 0.02 * (0.5 + l.w)
+            const fx = (dx / d) * f
+            const fy = (dy / d) * f
+            l.s.vx += fx; l.s.vy += fy; l.t.vx -= fx; l.t.vy -= fy
+          }
+          for (const n of nodes) {
+            n.vx += (W / 2 - n.x) * 0.002
+            n.vy += (H / 2 - n.y) * 0.002
+            n.vx *= 0.85; n.vy *= 0.85
+            n.x += n.vx; n.y += n.vy
+            n.x = Math.max(14, Math.min(W - 14, n.x))
+            n.y = Math.max(14, Math.min(H - 14, n.y))
+          }
+          draw()
+          state.ticks++
+          if (state.ticks < 500) state.raf = requestAnimationFrame(tick)
+        }
+
+        function draw() {
+          ctx.clearRect(0, 0, W, H)
+          for (const l of links) {
+            const dim = l.s.status === 'deprecated' || l.t.status === 'deprecated'
+            ctx.strokeStyle = dim ? 'rgba(38,36,31,0.05)' : 'rgba(38,36,31,0.13)'
+            ctx.lineWidth = Math.max(0.5, l.w * 2)
+            ctx.beginPath()
+            ctx.moveTo(l.s.x, l.s.y)
+            ctx.lineTo(l.t.x, l.t.y)
+            ctx.stroke()
+          }
+          for (const n of nodes) {
+            const r = 5 + Math.min(6, n.importance || 0)
+            ctx.globalAlpha = n.status === 'deprecated' ? 0.4 : 1
+            ctx.fillStyle = graphNodeColor(n)
+            ctx.beginPath()
+            ctx.arc(n.x, n.y, r, 0, Math.PI * 2)
+            ctx.fill()
+            ctx.globalAlpha = 1
+          }
+        }
+
+        tick()
       }
 
       document.getElementById('confirm-dialog').addEventListener('click', (e) => {
