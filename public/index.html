@@ -2414,7 +2414,12 @@
                 <span><i class="gl-dot" style="background:#4a7c8c"></i>Events</span>
                 <span><i class="gl-dot" style="background:#9a958a"></i>Unsorted</span>
               </div>
-              <button class="graph-refresh" onclick="loadGraph()" title="Refresh"><i class="ti ti-refresh"></i></button>
+              <div class="graph-controls">
+                <button class="graph-btn" onclick="graphZoom(0.8)" title="Zoom out"><i class="ti ti-minus"></i></button>
+                <button class="graph-btn" onclick="graphZoom(1.25)" title="Zoom in"><i class="ti ti-plus"></i></button>
+                <button class="graph-btn" onclick="graphFit()" title="Fit to view"><i class="ti ti-maximize"></i></button>
+                <button class="graph-btn" onclick="loadGraph()" title="Refresh"><i class="ti ti-refresh"></i></button>
+              </div>
             </div>
             <canvas id="graph-canvas"></canvas>
             <div class="graph-empty" id="graph-empty" style="display:none">No connections yet — link memories, or let them auto-connect as you add more.</div>
@@ -2478,8 +2483,10 @@
       .graph-legend { display: flex; gap: 14px; font-size: 11px; color: var(--text-secondary); flex-wrap: wrap; }
       .graph-legend span { display: inline-flex; align-items: center; gap: 5px; }
       .graph-legend .gl-dot { width: 9px; height: 9px; border-radius: 50%; display: inline-block; }
-      .graph-refresh { background: none; border: none; color: var(--text-secondary); cursor: pointer; font-size: 16px; padding: 4px; }
-      #graph-canvas { flex: 1 1 auto; width: 100%; min-height: 320px; display: block; touch-action: none; }
+      .graph-controls { display: flex; gap: 4px; }
+      .graph-btn { background: none; border: 1px solid var(--border-input); border-radius: 8px; color: var(--text-secondary); cursor: pointer; font-size: 15px; width: 30px; height: 30px; display: inline-flex; align-items: center; justify-content: center; padding: 0; }
+      .graph-btn:hover { background: var(--accent-soft); color: var(--accent); }
+      #graph-canvas { flex: 1 1 auto; width: 100%; min-height: 320px; display: block; touch-action: none; cursor: grab; }
       .graph-empty { padding: 48px 24px; text-align: center; color: var(--text-tertiary); font-size: 14px; }
       .view-related { margin-top: 14px; border-top: 1px solid var(--border-input); padding-top: 12px; }
       .view-related-label { font-size: 11px; font-weight: 600; color: var(--text-tertiary); text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 8px; }
@@ -3457,7 +3464,6 @@
         canvas.width = W * dpr
         canvas.height = H * dpr
         const ctx = canvas.getContext('2d')
-        ctx.scale(dpr, dpr)
 
         const byId = {}
         nodes.forEach((n, i) => {
@@ -3469,48 +3475,120 @@
         })
         const links = edges.map((e) => ({ s: byId[e.source], t: byId[e.target], w: e.weight })).filter((l) => l.s && l.t)
 
-        const state = { raf: 0, ticks: 0, hover: null, settled: false }
+        // cam maps world → screen: screen = world * scale + (x, y). Node coords are in world space.
+        const cam = { x: 0, y: 0, scale: 1 }
+        const pointers = new Map()
+        const state = { raf: 0, running: false, hover: null, dragNode: null, panning: false, panStart: null, moved: false, downId: null, pinch: null, didFit: false, cam }
         graphState = state
 
         const SHOW_LABELS = nodes.length <= 50 // hide always-on labels on big graphs (hover still works)
+        const nodeRadius = (n) => 5 + Math.min(6, n.importance || 0)
 
-        function nearestNode(ev) {
-          const r = canvas.getBoundingClientRect()
-          const mx = ev.clientX - r.left
-          const my = ev.clientY - r.top
-          let best = null
-          let bestD = 22 * 22
+        const localXY = (ev) => { const r = canvas.getBoundingClientRect(); return { x: ev.clientX - r.left, y: ev.clientY - r.top } }
+        const screenToWorld = (sx, sy) => ({ x: (sx - cam.x) / cam.scale, y: (sy - cam.y) / cam.scale })
+        function nodeAt(sx, sy) {
+          const w = screenToWorld(sx, sy)
+          const tol = 18 / cam.scale
+          let best = null, bestD = tol * tol
           for (const n of nodes) {
-            const dx = n.x - mx
-            const dy = n.y - my
-            const d = dx * dx + dy * dy
+            const dx = n.x - w.x, dy = n.y - w.y, d = dx * dx + dy * dy
             if (d < bestD) { bestD = d; best = n }
           }
           return best
         }
 
-        canvas.onclick = (ev) => {
-          const best = nearestNode(ev)
-          if (best) openView({ id: best.id, content: best.label, tags: best.tags }, null)
+        // ── camera: zoom toward a screen point, and fit-to-view ──
+        const clampScale = (s) => Math.max(0.25, Math.min(4, s))
+        function zoomAround(sx, sy, factor) {
+          const ns = clampScale(cam.scale * factor)
+          cam.x = sx - (sx - cam.x) * (ns / cam.scale)
+          cam.y = sy - (sy - cam.y) * (ns / cam.scale)
+          cam.scale = ns
+          requestDraw()
         }
-        canvas.onmousemove = (ev) => {
-          const prev = state.hover
-          state.hover = nearestNode(ev)
-          canvas.style.cursor = state.hover ? 'pointer' : 'default'
-          if (state.settled && prev !== state.hover) draw()
+        function fit() {
+          if (!nodes.length) return
+          let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity
+          for (const n of nodes) { minX = Math.min(minX, n.x); maxX = Math.max(maxX, n.x); minY = Math.min(minY, n.y); maxY = Math.max(maxY, n.y) }
+          const pad = 70
+          const gw = (maxX - minX) || 1, gh = (maxY - minY) || 1
+          cam.scale = clampScale(Math.min((W - pad) / gw, (H - pad) / gh, 1.4))
+          cam.x = W / 2 - ((minX + maxX) / 2) * cam.scale
+          cam.y = H / 2 - ((minY + maxY) / 2) * cam.scale
+          requestDraw()
         }
-        canvas.onmouseleave = () => {
-          if (state.hover) { state.hover = null; if (state.settled) draw() }
+        state.api = { zoomBy: (f) => zoomAround(W / 2, H / 2, f), fit }
+
+        // ── input: wheel zoom, pointer drag/pan, two-pointer pinch ──
+        canvas.addEventListener('wheel', (ev) => { ev.preventDefault(); const p = localXY(ev); zoomAround(p.x, p.y, Math.exp(-ev.deltaY * 0.0015)) }, { passive: false })
+
+        const twoPointers = () => [...pointers.values()]
+        function startPinch() {
+          const [a, b] = twoPointers()
+          state.dragNode = null; state.panning = false
+          state.pinch = { dist: Math.hypot(a.x - b.x, a.y - b.y) || 1, scale: cam.scale }
+        }
+        function movePinch() {
+          const [a, b] = twoPointers()
+          const dist = Math.hypot(a.x - b.x, a.y - b.y) || 1
+          const mid = { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 }
+          zoomAround(mid.x, mid.y, (dist / state.pinch.dist) * (state.pinch.scale / cam.scale))
         }
 
-        function nodeRadius(n) { return 5 + Math.min(6, n.importance || 0) }
+        canvas.addEventListener('pointerdown', (ev) => {
+          canvas.setPointerCapture(ev.pointerId)
+          const p = localXY(ev)
+          pointers.set(ev.pointerId, p)
+          if (pointers.size === 2) { startPinch(); return }
+          state.moved = false
+          state.downId = ev.pointerId
+          const hit = nodeAt(p.x, p.y)
+          if (hit) state.dragNode = hit
+          else { state.panning = true; state.panStart = { x: ev.clientX - cam.x, y: ev.clientY - cam.y } }
+          canvas.style.cursor = 'grabbing'
+        })
+
+        canvas.addEventListener('pointermove', (ev) => {
+          const p = localXY(ev)
+          if (pointers.has(ev.pointerId)) pointers.set(ev.pointerId, p)
+          if (state.pinch && pointers.size === 2) { movePinch(); return }
+          if (state.dragNode) {
+            const w = screenToWorld(p.x, p.y)
+            state.dragNode.x = w.x; state.dragNode.y = w.y; state.dragNode.vx = 0; state.dragNode.vy = 0
+            state.moved = true
+            energize() // reheat so the rest of the graph re-settles around the dragged node
+          } else if (state.panning) {
+            cam.x = ev.clientX - state.panStart.x; cam.y = ev.clientY - state.panStart.y
+            state.moved = true
+            requestDraw()
+          } else {
+            const prev = state.hover
+            state.hover = nodeAt(p.x, p.y)
+            canvas.style.cursor = state.hover ? 'pointer' : 'grab'
+            if (!state.running && prev !== state.hover) draw()
+          }
+        })
+
+        function endPointer(ev) {
+          pointers.delete(ev.pointerId)
+          try { canvas.releasePointerCapture(ev.pointerId) } catch (e) {}
+          if (state.pinch && pointers.size < 2) state.pinch = null
+          if (ev.pointerId === state.downId) {
+            if (state.dragNode && !state.moved) openView({ id: state.dragNode.id, content: state.dragNode.label, tags: state.dragNode.tags }, null)
+            state.dragNode = null; state.panning = false; state.downId = null
+            canvas.style.cursor = 'grab'
+            energize()
+          }
+        }
+        canvas.addEventListener('pointerup', endPointer)
+        canvas.addEventListener('pointercancel', endPointer)
+        canvas.addEventListener('pointerleave', () => { if (!state.dragNode && !state.panning && state.hover) { state.hover = null; if (!state.running) draw() } })
 
         function shortLabel(n) {
           const t = (n.label || '').replace(/\s+/g, ' ').trim()
           return t.length > 22 ? t.slice(0, 22).trimEnd() + '…' : t
         }
-
-        // A rounded label pill centered horizontally at cx, with its top at topY.
+        // A rounded label pill centered horizontally at cx, with its top at topY (world coords).
         function labelPill(text, cx, topY, emphasize, alpha) {
           ctx.font = (emphasize ? '600 ' : '') + '11px "DM Sans", system-ui, sans-serif'
           const tw = ctx.measureText(text).width
@@ -3543,8 +3621,7 @@
               let d2 = dx * dx + dy * dy || 0.01
               const d = Math.sqrt(d2)
               const f = 2000 / d2
-              const fx = (dx / d) * f
-              const fy = (dy / d) * f
+              const fx = (dx / d) * f, fy = (dy / d) * f
               a.vx += fx; a.vy += fy; b.vx -= fx; b.vy -= fy
             }
           }
@@ -3553,28 +3630,34 @@
             let dy = l.t.y - l.s.y
             const d = Math.sqrt(dx * dx + dy * dy) || 0.01
             const f = (d - 88) * 0.02 * (0.5 + l.w)
-            const fx = (dx / d) * f
-            const fy = (dy / d) * f
+            const fx = (dx / d) * f, fy = (dy / d) * f
             l.s.vx += fx; l.s.vy += fy; l.t.vx -= fx; l.t.vy -= fy
           }
+          let energy = 0
           for (const n of nodes) {
+            if (n === state.dragNode) { n.vx = 0; n.vy = 0; continue } // pinned under the cursor
             n.vx += (W / 2 - n.x) * 0.002
             n.vy += (H / 2 - n.y) * 0.002
             n.vx *= 0.85; n.vy *= 0.85
             n.x += n.vx; n.y += n.vy
-            n.x = Math.max(16, Math.min(W - 16, n.x))
-            n.y = Math.max(16, Math.min(H - 22, n.y))
+            energy += n.vx * n.vx + n.vy * n.vy
           }
           draw()
-          state.ticks++
-          if (state.ticks < 500) state.raf = requestAnimationFrame(tick)
-          else state.settled = true
+          if (state.dragNode || energy > 0.04) {
+            state.raf = requestAnimationFrame(tick)
+          } else {
+            state.running = false
+            if (!state.didFit) { state.didFit = true; fit() } // frame the graph once it first settles
+          }
         }
+        function energize() { if (!state.running) { state.running = true; state.raf = requestAnimationFrame(tick) } }
+        function requestDraw() { if (!state.running) draw() }
 
         function draw() {
+          ctx.setTransform(dpr, 0, 0, dpr, 0, 0)
           ctx.clearRect(0, 0, W, H)
+          ctx.setTransform(dpr * cam.scale, 0, 0, dpr * cam.scale, dpr * cam.x, dpr * cam.y)
           const hover = state.hover
-          // edges (highlight the hovered node's links)
           for (const l of links) {
             const dim = l.s.status === 'deprecated' || l.t.status === 'deprecated'
             const lit = hover && (l.s === hover || l.t === hover)
@@ -3585,7 +3668,6 @@
             ctx.lineTo(l.t.x, l.t.y)
             ctx.stroke()
           }
-          // nodes
           for (const n of nodes) {
             const r = nodeRadius(n)
             ctx.globalAlpha = n.status === 'deprecated' ? 0.4 : 1
@@ -3603,14 +3685,13 @@
             }
             ctx.globalAlpha = 1
           }
-          // always-on short labels (small graphs only); skip the hovered one — it gets the full label
-          if (SHOW_LABELS) {
+          // labels scale with zoom; hide the always-on ones when zoomed far out to avoid clutter
+          if (SHOW_LABELS && cam.scale >= 0.5) {
             for (const n of nodes) {
               if (n === hover) continue
               labelPill(shortLabel(n), n.x, n.y + nodeRadius(n) + 4, false, n.status === 'deprecated' ? 0.5 : 1)
             }
           }
-          // hovered node: fuller label, on top
           if (hover) {
             const full = (hover.label || '').replace(/\s+/g, ' ').trim()
             const text = full.length > 48 ? full.slice(0, 48).trimEnd() + '…' : full
@@ -3618,8 +3699,11 @@
           }
         }
 
-        tick()
+        energize()
       }
+
+      function graphZoom(factor) { if (graphState && graphState.api) graphState.api.zoomBy(factor) }
+      function graphFit() { if (graphState && graphState.api) graphState.api.fit() }
 
       document.getElementById('confirm-dialog').addEventListener('click', (e) => {
         if (e.target === document.getElementById('confirm-dialog')) closeConfirm()
