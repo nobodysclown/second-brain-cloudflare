@@ -362,6 +362,28 @@ export async function getConnections(id: string, type: string | undefined, env: 
   return out;
 }
 
+// Auto-link a freshly-stored entry to its most-similar existing neighbors with
+// inferred `relates_to` edges. Reuses the similarity scores already computed during
+// duplicate/contradiction detection — no extra embed or Vectorize query. Only the
+// strongest few links above a confidence floor are kept so the graph stays sparse;
+// the nightly graph pass later refines and types these.
+const EDGE_INFER_THRESHOLD = 0.55; // min similarity to auto-link
+const EDGE_INFER_MAX = 3;          // max inferred links per new entry
+
+export async function inferEdgesOnWrite(
+  newId: string,
+  neighbors: { id: string; score: number }[],
+  env: Env,
+): Promise<void> {
+  const top = neighbors
+    .filter(n => n.id !== newId && n.score >= EDGE_INFER_THRESHOLD)
+    .sort((a, b) => b.score - a.score)
+    .slice(0, EDGE_INFER_MAX);
+  for (const n of top) {
+    await createEdge(newId, n.id, "relates_to", { weight: n.score, provenance: "inferred" }, env);
+  }
+}
+
 // ─── Runtime state ────────────────────────────────────────────────────────────
 
 let dbReady = false;
@@ -536,10 +558,21 @@ export async function checkDuplicateAndContradiction(content: string, env: Env):
   duplicate: DuplicateResult;
   contradiction: ContradictionResult;
   mergeAction: MergeAction | null;
+  neighbors: { id: string; score: number }[];
 }> {
   const sample = getDuplicateCheckSample(content);
   const values = await embed(sample, env);
   const { matches } = await env.VECTORIZE.query(values, { topK: 5, returnMetadata: "all" });
+
+  // Neighbors for graph auto-linking (issue #16): the topK matches collapsed to
+  // parent ids (strongest score per parent). Exposed so captureEntry can create
+  // relates_to edges without a second embed/query.
+  const neighborScores = new Map<string, number>();
+  for (const m of matches) {
+    const pid = (m.metadata as any)?.parentId ?? m.id;
+    neighborScores.set(pid, Math.max(neighborScores.get(pid) ?? 0, m.score));
+  }
+  const neighbors = [...neighborScores.entries()].map(([id, score]) => ({ id, score }));
 
   // ── Duplicate: derived from top match ───────────────────────────────────────
   let duplicate: DuplicateResult = { status: "unique" };
@@ -661,7 +694,7 @@ Respond with JSON only. No text outside the JSON object.
     }
   }
 
-  return { duplicate, contradiction, mergeAction };
+  return { duplicate, contradiction, mergeAction, neighbors };
 }
 
 // ─── Chunking ─────────────────────────────────────────────────────────────────
@@ -1633,7 +1666,7 @@ export async function captureEntry(
   const c = cleanContent || raw;
   const t = [...new Set([...tags.map(tag => tag.toLowerCase()), ...hashtags])];
 
-  const { duplicate: dup, contradiction, mergeAction } = await checkDuplicateAndContradiction(c, env);
+  const { duplicate: dup, contradiction, mergeAction, neighbors } = await checkDuplicateAndContradiction(c, env);
 
   if (dup.status === "blocked") {
     return { status: "blocked", matchId: dup.matchId, score: dup.score };
@@ -1738,8 +1771,14 @@ export async function captureEntry(
     } catch (e) {
       console.error("Contradiction deprecation failed (non-fatal):", e);
     }
+    // New entry won the contradiction — it's a real new node, so auto-link it (#16).
+    ctx.waitUntil(inferEdgesOnWrite(id, neighbors, env).catch(e => console.error("Edge inference failed (non-fatal):", e)));
     return { status: "contradiction", id, resolvedConflict: conflictId, reason: contradiction.reason };
   }
+
+  // Reached here without contradiction handling (flagged-new-row or stored) — both
+  // are genuinely new nodes, so auto-link to similar neighbors (#16).
+  ctx.waitUntil(inferEdgesOnWrite(id, neighbors, env).catch(e => console.error("Edge inference failed (non-fatal):", e)));
 
   if (dup.status === "flagged") {
     return { status: "flagged", id, matchId: dup.matchId, score: dup.score };

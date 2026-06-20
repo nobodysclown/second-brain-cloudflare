@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach } from "vitest";
-import { createEdge, expandGraph, isValidEdgeType, isSymmetric } from "../../src/index";
+import { createEdge, expandGraph, inferEdgesOnWrite, isValidEdgeType, isSymmetric } from "../../src/index";
 import { makeTestEnv, makeTestDb } from "../helpers/make-env";
 import type { Env } from "../../src/index";
 import { D1Mock } from "../helpers/d1-mock";
@@ -118,5 +118,53 @@ describe("expandGraph", () => {
     const out = await expandGraph(["a"], { hops: 2 }, env);
     const byId = Object.fromEntries(out.map(n => [n.id, n.hop]));
     expect(byId).toEqual({ b: 1, c: 2 });
+  });
+});
+
+describe("inferEdgesOnWrite", () => {
+  let env: Env;
+  let db: D1Mock;
+
+  beforeEach(() => {
+    db = makeTestDb();
+    env = makeTestEnv(db);
+  });
+
+  it("creates relates_to edges to neighbors above the similarity threshold", async () => {
+    await inferEdgesOnWrite("new", [
+      { id: "a", score: 0.9 },
+      { id: "b", score: 0.6 },
+      { id: "c", score: 0.4 }, // below threshold — excluded
+    ], env);
+    expect(db.edges).toHaveLength(2);
+    expect(db.edges.every((e: any) => e.type === "relates_to" && e.provenance === "inferred")).toBe(true);
+    const linked = db.edges.flatMap((e: any) => [e.source_id, e.target_id]).filter((id: string) => id !== "new");
+    expect(linked.sort()).toEqual(["a", "b"]);
+  });
+
+  it("never links the new entry to itself", async () => {
+    await inferEdgesOnWrite("new", [{ id: "new", score: 0.99 }, { id: "a", score: 0.8 }], env);
+    expect(db.edges).toHaveLength(1);
+    expect([db.edges[0].source_id, db.edges[0].target_id].sort()).toEqual(["a", "new"]);
+  });
+
+  it("caps at the top 3 strongest neighbors", async () => {
+    await inferEdgesOnWrite("new", [
+      { id: "a", score: 0.9 }, { id: "b", score: 0.85 }, { id: "c", score: 0.8 },
+      { id: "d", score: 0.75 }, { id: "e", score: 0.7 },
+    ], env);
+    expect(db.edges).toHaveLength(3);
+    const linked = db.edges.flatMap((e: any) => [e.source_id, e.target_id]).filter((id: string) => id !== "new");
+    expect(linked.sort()).toEqual(["a", "b", "c"]);
+  });
+
+  it("uses the similarity score as the edge weight", async () => {
+    await inferEdgesOnWrite("new", [{ id: "a", score: 0.77 }], env);
+    expect(db.edges[0].weight).toBeCloseTo(0.77);
+  });
+
+  it("writes nothing when there are no qualifying neighbors", async () => {
+    await inferEdgesOnWrite("new", [{ id: "a", score: 0.3 }], env);
+    expect(db.edges).toHaveLength(0);
   });
 });
