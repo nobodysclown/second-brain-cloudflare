@@ -489,6 +489,19 @@ export async function inferEdgesOnWrite(
   }
 }
 
+// Compute auto-link neighbors from a query embedding: the topK Vectorize matches
+// collapsed to parent ids (strongest score per parent). Lets the append path reuse the
+// same inference as on capture without re-deriving the dedupe logic.
+async function neighborsFromVectorQuery(values: number[], env: Env): Promise<{ id: string; score: number }[]> {
+  const { matches } = await env.VECTORIZE.query(values, { topK: 5, returnMetadata: "all" });
+  const scores = new Map<string, number>();
+  for (const m of matches) {
+    const pid = (m.metadata as any)?.parentId ?? m.id;
+    scores.set(pid, Math.max(scores.get(pid) ?? 0, m.score));
+  }
+  return [...scores.entries()].map(([id, score]) => ({ id, score }));
+}
+
 // ─── Runtime state ────────────────────────────────────────────────────────────
 
 let dbReady = false;
@@ -1196,6 +1209,13 @@ async function appendToEntry(
       console.error("Old vector cleanup failed (non-fatal):", e);
     }
 
+    // Auto-link the updated entry to similar neighbors (#16) — same inference as on capture.
+    try {
+      await inferEdgesOnWrite(id, await neighborsFromVectorQuery(await embed(addition, env), env), env);
+    } catch (e) {
+      console.error("Append auto-link failed (non-fatal):", e);
+    }
+
     return;
   }
 
@@ -1228,6 +1248,13 @@ async function appendToEntry(
   await env.DB.prepare(
     `UPDATE entries SET content = ?, vector_ids = ? WHERE id = ?`
   ).bind(newContent, JSON.stringify([...existingVectorIds, newChunkId]), id).run();
+
+  // Auto-link the updated entry to similar neighbors (#16) — reuse the addition embedding.
+  try {
+    await inferEdgesOnWrite(id, await neighborsFromVectorQuery(values, env), env);
+  } catch (e) {
+    console.error("Append auto-link failed (non-fatal):", e);
+  }
 }
 
 // ─── Synthesize insight from retrieved memories ───────────────────────────────
@@ -1529,6 +1556,23 @@ export interface RecallMatch {
 export interface RecallSearchResult {
   matches: RecallMatch[];
   insight: string;
+}
+
+// Render recall matches as the MCP tool's text reply. Crucially includes each entry's
+// ID so an LLM can act on a result (link, connections, append, update, forget) without
+// a second list_recent round-trip — recall used to drop the ID, which left tools unable
+// to reference the memories they just found.
+export function renderRecallText(matches: RecallMatch[], insight: string): string {
+  const text = matches.map((m, i) => {
+    const date = new Date(m.createdAt).toLocaleDateString();
+    const tagList = m.tags.length ? ` [${m.tags.join(", ")}]` : "";
+    const src = m.source ? ` · ${m.source}` : "";
+    const score = (m.score * 100).toFixed(0);
+    const updateLabel = m.isUpdate ? " [updated]" : "";
+    const hopLabel = m.hop > 0 ? ` [related · ${m.hop} hop${m.hop > 1 ? "s" : ""}]` : "";
+    return `${i + 1}. [${date}${src}${tagList}] (${score}% match)${updateLabel}${hopLabel}\nID: ${m.id}\n${m.content}`;
+  }).join("\n\n");
+  return insight ? `**Insight:** ${insight}\n\n---\n\n${text}` : text;
 }
 
 // ─── Hybrid recall: keyword search + Reciprocal Rank Fusion ────────────────────
@@ -2255,18 +2299,7 @@ function buildMcpServer(env: Env, ctx: ExecutionContext): McpServer {
         return { content: [{ type: "text", text: "Nothing found matching that query." }] };
       }
 
-      const text = matches.map((m, i) => {
-        const date = new Date(m.createdAt).toLocaleDateString();
-        const tagList = m.tags.length ? ` [${m.tags.join(", ")}]` : "";
-        const src = m.source ? ` · ${m.source}` : "";
-        const score = (m.score * 100).toFixed(0);
-        const updateLabel = m.isUpdate ? " [updated]" : "";
-        const hopLabel = m.hop > 0 ? ` [related · ${m.hop} hop${m.hop > 1 ? "s" : ""}]` : "";
-        return `${i + 1}. [${date}${src}${tagList}] (${score}% match)${updateLabel}${hopLabel}\n${m.content}`;
-      }).join("\n\n");
-
-      const finalText = insight ? `**Insight:** ${insight}\n\n---\n\n${text}` : text;
-      return { content: [{ type: "text", text: finalText }] };
+      return { content: [{ type: "text", text: renderRecallText(matches, insight) }] };
     }
   );
 
