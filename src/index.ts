@@ -1418,6 +1418,7 @@ export interface RecallMatch {
   tags: string[];
   source: string;
   isUpdate: boolean;
+  hop: number; // 0 = direct match; ≥1 = surfaced via graph expansion (issue #16)
 }
 
 export interface RecallSearchResult {
@@ -1505,12 +1506,13 @@ function fuseDenseAndKeyword(
 }
 
 export async function recallEntries(
-  params: { query: string; topK: number; tag?: string; after?: number; before?: number; kind?: MemoryKind },
+  params: { query: string; topK: number; tag?: string; after?: number; before?: number; kind?: MemoryKind; hops?: number },
   env: Env,
   ctx: ExecutionContext
 ): Promise<RecallSearchResult> {
   const { query, topK } = params;
   let { tag, after, before, kind } = params;
+  const hops = Math.max(0, Math.min(GRAPH_MAX_HOPS, params.hops ?? 0));
   const now = Date.now();
 
   let embedQuery = query;
@@ -1612,11 +1614,29 @@ export async function recallEntries(
 
   if (!deduped.length) return { matches: [], insight: "" };
 
-  // Fetch full content from D1 for all matched parent IDs, applying filters: auto-pattern
+  const seedParentIds = deduped.map((m) => (m.metadata as any)?.parentId ?? m.id);
+
+  // Multi-hop expansion (issue #16): walk the graph outward from the direct-match seeds
+  // and fold in related memories. Each expanded node is scored as a fraction of the
+  // WEAKEST seed (minSeedScore × decay^hop × edgeWeight), so a related node can never
+  // outrank a direct match — recall never regresses — while neighbors still order by
+  // graph distance and link strength. hops:0 → no expansion → byte-for-byte today's path.
+  let expandedScored: { parentId: string; score: number; hop: number }[] = [];
+  if (hops > 0) {
+    const minSeedScore = deduped.reduce((mn, m) => Math.min(mn, m.score), Infinity);
+    const expanded = await expandGraph(seedParentIds, { hops }, env);
+    expandedScored = expanded.map(n => ({
+      parentId: n.id,
+      hop: n.hop,
+      score: minSeedScore * Math.pow(GRAPH_HOP_DECAY, n.hop) * n.viaWeight,
+    }));
+  }
+
+  // Fetch full content from D1 for seeds + expanded nodes, applying filters: auto-pattern
   // exclusion, status:deprecated exclusion, optional kind match, and optional after/before range
-  const parentIds = deduped.map((m) => (m.metadata as any)?.parentId ?? m.id);
-  const placeholders = parentIds.map(() => "?").join(", ");
-  const d1Bindings: (string | number)[] = [...parentIds];
+  const allParentIds = [...seedParentIds, ...expandedScored.map(e => e.parentId)];
+  const placeholders = allParentIds.map(() => "?").join(", ");
+  const d1Bindings: (string | number)[] = [...allParentIds];
   let d1Sql = `SELECT id, content, tags, source, created_at FROM entries WHERE id IN (${placeholders}) AND tags NOT LIKE '%"auto-pattern"%' AND tags NOT LIKE '%"status:deprecated"%'`;
   if (kind && (KIND_VALUES as readonly string[]).includes(kind)) {
     // Safe to interpolate: `kind` is validated against the KIND_VALUES enum just above,
@@ -1630,26 +1650,25 @@ export async function recallEntries(
 
   const d1Map = new Map(d1Rows.map((r) => [r.id as string, r]));
 
-  // Increment recall_count for entries actually shown
+  // Increment recall_count for the DIRECT seeds shown — never for graph-expanded
+  // neighbors, or well-connected nodes would inflate their own ranking (feedback loop).
+  const seedIdSet = new Set(seedParentIds);
   ctx.waitUntil(
     Promise.all(
-      [...d1Map.keys()].map(id =>
+      [...d1Map.keys()].filter(id => seedIdSet.has(id)).map(id =>
         env.DB.prepare(`UPDATE entries SET recall_count = recall_count + 1 WHERE id = ?`).bind(id).run()
       )
     ).catch(e => console.error("recall_count update failed (non-fatal):", e))
   );
 
-  const matches: RecallMatch[] = deduped.flatMap((m) => {
+  const seedMatches: RecallMatch[] = deduped.flatMap((m) => {
     const meta = m.metadata as Record<string, any>;
     const parentId = (meta?.parentId ?? m.id) as string;
     const row = d1Map.get(parentId);
-    const isUpdate = !!meta?.isUpdate;
-
     if (!row) {
       // D1 row not found — either filtered out (e.g. status:deprecated) or genuinely missing
       return [];
     }
-
     return [{
       id: parentId,
       content: row.content as string,
@@ -1657,17 +1676,41 @@ export async function recallEntries(
       createdAt: row.created_at as number,
       tags: JSON.parse(row.tags ?? "[]"),
       source: row.source as string,
-      isUpdate,
+      isUpdate: !!meta?.isUpdate,
+      hop: 0,
     }];
   });
+
+  const expandedMatches: RecallMatch[] = expandedScored.flatMap((e) => {
+    const row = d1Map.get(e.parentId);
+    if (!row) return []; // filtered out (deprecated/kind/range) or missing
+    return [{
+      id: e.parentId,
+      content: row.content as string,
+      score: e.score,
+      createdAt: row.created_at as number,
+      tags: JSON.parse(row.tags ?? "[]"),
+      source: row.source as string,
+      isUpdate: false,
+      hop: e.hop,
+    }];
+  });
+
+  // Seeds always outrank expanded by construction, so they fill the top and expanded
+  // occupy only leftover slots — a direct match is never displaced by a neighbor.
+  const matches: RecallMatch[] = [...seedMatches, ...expandedMatches]
+    .sort((a, b) => b.score - a.score)
+    .slice(0, topK);
 
   // Normalize fused scores to 0–1 (top match = 1.0) so the displayed match % is a clean,
   // monotonically-decreasing scale rather than raw RRF values.
   const maxScore = matches.reduce((mx, m) => Math.max(mx, m.score), 0);
   if (maxScore > 0) for (const m of matches) m.score = m.score / maxScore;
 
-  const insight = d1Rows.length > 1
-    ? await synthesizeInsight(embedQuery, d1Rows as { id: string; content: string }[], env)
+  // Synthesize over exactly what's shown (seeds + any surfaced neighbors) so the
+  // insight stays grounded in the returned results.
+  const insight = matches.length > 1
+    ? await synthesizeInsight(embedQuery, matches.map(m => ({ id: m.id, content: m.content })), env)
     : "";
 
   if (d1Rows.length >= 5) {
@@ -2097,10 +2140,11 @@ function buildMcpServer(env: Env, ctx: ExecutionContext): McpServer {
         after: z.number().int().optional().describe("Only return entries after this Unix ms timestamp"),
         before: z.number().int().optional().describe("Only return entries before this Unix ms timestamp"),
         kind: z.enum([...KIND_VALUES] as [string, ...string[]]).optional().describe("Filter to episodic (events) or semantic (facts/knowledge)"),
+        hops: z.number().int().min(0).max(3).default(0).describe("Graph expansion depth: 0 = direct matches only (default); 1–2 also surfaces related memories linked in the graph"),
       },
     },
-    async ({ query, topK, tag, after, before, kind }) => {
-      const { matches, insight } = await recallEntries({ query, topK, tag, after, before, kind: kind as MemoryKind | undefined }, env, ctx);
+    async ({ query, topK, tag, after, before, kind, hops }) => {
+      const { matches, insight } = await recallEntries({ query, topK, tag, after, before, kind: kind as MemoryKind | undefined, hops }, env, ctx);
 
       if (!matches.length) {
         return { content: [{ type: "text", text: "Nothing found matching that query." }] };
@@ -2112,7 +2156,8 @@ function buildMcpServer(env: Env, ctx: ExecutionContext): McpServer {
         const src = m.source ? ` · ${m.source}` : "";
         const score = (m.score * 100).toFixed(0);
         const updateLabel = m.isUpdate ? " [updated]" : "";
-        return `${i + 1}. [${date}${src}${tagList}] (${score}% match)${updateLabel}\n${m.content}`;
+        const hopLabel = m.hop > 0 ? ` [related · ${m.hop} hop${m.hop > 1 ? "s" : ""}]` : "";
+        return `${i + 1}. [${date}${src}${tagList}] (${score}% match)${updateLabel}${hopLabel}\n${m.content}`;
       }).join("\n\n");
 
       const finalText = insight ? `**Insight:** ${insight}\n\n---\n\n${text}` : text;
@@ -2496,8 +2541,9 @@ const defaultHandler = {
       const before = url.searchParams.has("before") ? parseInt(url.searchParams.get("before")!, 10) : undefined;
       const kindParam = url.searchParams.get("kind")?.trim();
       const kind = kindParam && (KIND_VALUES as readonly string[]).includes(kindParam) ? kindParam as MemoryKind : undefined;
+      const hops = Math.min(Math.max(parseInt(url.searchParams.get("hops") ?? "0", 10), 0), 3);
 
-      const { matches, insight } = await recallEntries({ query, topK, tag, after, before, kind }, env, ctx);
+      const { matches, insight } = await recallEntries({ query, topK, tag, after, before, kind, hops }, env, ctx);
 
       if (!matches.length) {
         return json({ ok: true, results: [], message: "Nothing found matching that query." });
@@ -2513,6 +2559,7 @@ const defaultHandler = {
           source: m.source,
           created_at: m.createdAt,
           updated: m.isUpdate,
+          hop: m.hop,
         })),
         insight: insight || null,
       });
