@@ -120,6 +120,40 @@ function vectorizeHealthBanner(health) {
   };
 }
 
+/* Build the inner HTML for the dashboard warning banner. Kept separate from the
+ * DOM mutation so it can be unit-tested: it must escape every interpolated field. */
+function vectorizeBannerHtml(banner) {
+  return (
+    '<strong>' + escHtml(banner.title) + '</strong> ' +
+    '<details style="margin-top:6px"><summary style="cursor:pointer">How to fix</summary>' +
+    '<p style="margin:6px 0 2px">Run this once in your terminal:</p>' +
+    '<pre style="white-space:pre-wrap;background:rgba(0,0,0,0.25);padding:8px;border-radius:6px;margin:0">' + escHtml(banner.command) + '</pre>' +
+    '<p style="margin:6px 0 0">' + escHtml(banner.gui) + '</p></details>'
+  );
+}
+
+/* Mount, update, or remove the banner element against an injected document, and
+ * push page content down by the banner height while it is shown. The `doc`
+ * parameter lets this be unit-tested with a minimal fake document — no DOM
+ * environment required. Returns the element, or null when removed. */
+function syncVectorizeBanner(doc, banner) {
+  let el = doc.getElementById('vectorize-banner');
+  if (!banner) {
+    if (el) el.remove();
+    doc.body.style.paddingTop = '';
+    return null;
+  }
+  if (!el) {
+    el = doc.createElement('div');
+    el.id = 'vectorize-banner';
+    el.style.cssText = 'position:fixed;top:0;left:0;right:0;z-index:9999;background:#7c2d12;color:#fff;padding:10px 16px;font-size:13px;line-height:1.5;box-shadow:0 1px 4px rgba(0,0,0,0.25)';
+    doc.body.appendChild(el);
+  }
+  el.innerHTML = vectorizeBannerHtml(banner);
+  doc.body.style.paddingTop = (el.offsetHeight || 0) + 'px';
+  return el;
+}
+
 if (typeof module !== 'undefined' && module.exports) {
-  module.exports = { escHtml, escAttr, toDateStr, parseRecallResult, normalizeEntry, vectorizeHealthBanner };
+  module.exports = { escHtml, escAttr, toDateStr, parseRecallResult, normalizeEntry, vectorizeHealthBanner, vectorizeBannerHtml, syncVectorizeBanner };
 }
