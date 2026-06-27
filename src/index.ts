@@ -2685,6 +2685,15 @@ const defaultHandler = {
       });
     }
 
+    // GET /health — index/runtime health, used by the dashboard banner, the
+    // README verify step, and external uptime checks.
+    if (url.pathname === "/health" && request.method === "GET") {
+      const authErr = requireAuth(request, env);
+      if (authErr) return authErr;
+      const vectorize = await checkVectorizeHealth(env);
+      return json({ ok: vectorize.ok, vectorize });
+    }
+
     // GET /list
     if (url.pathname === "/list" && request.method === "GET") {
       const authErr = requireAuth(request, env);
