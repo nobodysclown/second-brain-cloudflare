@@ -107,6 +107,19 @@ function normalizeEntry(e) {
   };
 }
 
+/* Build the dashboard warning banner contents when the Vectorize index is
+ * missing. Returns null when healthy or when health is unknown, so a transient
+ * fetch failure never raises a false alarm. */
+function vectorizeHealthBanner(health) {
+  if (!health || !health.vectorize || health.vectorize.ok) return null;
+  const name = health.vectorize.indexName || 'second-brain-vectors';
+  return {
+    title: 'Semantic search is disabled. The Vectorize index "' + name + '" was not found.',
+    command: 'npx wrangler vectorize create ' + name + ' --dimensions=384 --metric=cosine',
+    gui: 'Or grant the Workers Builds API token the account-level Vectorize Edit permission in the Cloudflare dashboard (My Profile, API Tokens), then redeploy so the build creates the index automatically.'
+  };
+}
+
 if (typeof module !== 'undefined' && module.exports) {
-  module.exports = { escHtml, escAttr, toDateStr, parseRecallResult, normalizeEntry };
+  module.exports = { escHtml, escAttr, toDateStr, parseRecallResult, normalizeEntry, vectorizeHealthBanner };
 }

@@ -1,6 +1,6 @@
 import { describe, it, expect } from "vitest";
 
-const { parseRecallResult, escHtml, escAttr, toDateStr } = require("../../public/utils.js");
+const { parseRecallResult, escHtml, escAttr, toDateStr, vectorizeHealthBanner } = require("../../public/utils.js");
 
 describe("parseRecallResult", () => {
   it("parses a JSON array of entries", () => {
@@ -248,5 +248,29 @@ describe("toDateStr", () => {
   it("zero-pads December correctly", () => {
     const d = new Date(2026, 11, 31); // December 31 2026
     expect(toDateStr(d)).toBe("2026-12-31");
+  });
+});
+
+describe("vectorizeHealthBanner", () => {
+  it("returns null when vectorize is healthy", () => {
+    expect(vectorizeHealthBanner({ ok: true, vectorize: { ok: true, indexName: "second-brain-vectors" } })).toBeNull();
+  });
+
+  it("returns null when health is null or undefined (no false alarm)", () => {
+    expect(vectorizeHealthBanner(null)).toBeNull();
+    expect(vectorizeHealthBanner(undefined)).toBeNull();
+  });
+
+  it("returns a title and fix command naming the index when it is missing", () => {
+    const b = vectorizeHealthBanner({ ok: false, vectorize: { ok: false, indexName: "second-brain-vectors", error: "index not found" } });
+    expect(b).not.toBeNull();
+    expect(b.title).toContain("second-brain-vectors");
+    expect(b.command).toBe("npx wrangler vectorize create second-brain-vectors --dimensions=384 --metric=cosine");
+    expect(b.gui).toContain("Vectorize Edit");
+  });
+
+  it("falls back to the default index name when indexName is absent", () => {
+    const b = vectorizeHealthBanner({ ok: false, vectorize: { ok: false } });
+    expect(b.command).toContain("second-brain-vectors");
   });
 });
