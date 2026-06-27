@@ -1590,6 +1590,9 @@ export interface RecallMatch {
 export interface RecallSearchResult {
   matches: RecallMatch[];
   insight: string;
+  // True when the dense (Vectorize) step could not run — recall fell back to
+  // keyword-only. Lets callers tell the user semantic search is unavailable.
+  semanticUnavailable: boolean;
 }
 
 // Render recall matches as the MCP tool's text reply. Crucially includes each entry's
@@ -1697,6 +1700,7 @@ export async function recallEntries(
   let { tag, after, before, kind } = params;
   const hops = Math.max(0, Math.min(GRAPH_MAX_HOPS, params.hops ?? 0));
   const now = Date.now();
+  let semanticUnavailable = false;
 
   let embedQuery = query;
   if (after === undefined && before === undefined) {
@@ -1722,17 +1726,22 @@ export async function recallEntries(
     const { results: tagRows } = await env.DB.prepare(
       `SELECT id, vector_ids, content, tags, source, created_at FROM entries WHERE tags LIKE ?`
     ).bind(`%"${tag}"%`).all();
-    if (!tagRows.length) return { matches: [], insight: "" };
+    if (!tagRows.length) return { matches: [], insight: "", semanticUnavailable };
     keywordRows = tagRows as unknown as KeywordRow[];
 
     const vectorIds = [...new Set(
       (tagRows as any[]).flatMap(r => JSON.parse((r.vector_ids as string) ?? "[]") as string[])
     )];
-    if (!vectorIds.length) return { matches: [], insight: "" };
+    if (!vectorIds.length) return { matches: [], insight: "", semanticUnavailable };
 
     const vectors: VectorizeVector[] = [];
-    for (let i = 0; i < vectorIds.length; i += VECTORIZE_GET_BY_IDS_BATCH) {
-      vectors.push(...await env.VECTORIZE.getByIds(vectorIds.slice(i, i + VECTORIZE_GET_BY_IDS_BATCH)));
+    try {
+      for (let i = 0; i < vectorIds.length; i += VECTORIZE_GET_BY_IDS_BATCH) {
+        vectors.push(...await env.VECTORIZE.getByIds(vectorIds.slice(i, i + VECTORIZE_GET_BY_IDS_BATCH)));
+      }
+    } catch (e) {
+      console.error("Vectorize getByIds failed (degrading to keyword-only):", e);
+      semanticUnavailable = true;
     }
 
     results = {
@@ -1746,18 +1755,26 @@ export async function recallEntries(
     // Cloudflare Vectorize caps topK at 50 when returnMetadata="all" (error 40025).
     // Run the keyword search in parallel with the dense query.
     const vectorizeTopK = Math.min(topK * VECTORIZE_TOP_K_MULTIPLIER, 50);
-    const [denseResults, kwRows] = await Promise.all([
-      env.VECTORIZE.query(values, { topK: vectorizeTopK, returnMetadata: "all" }),
-      keywordSearch(tokens, env),
-    ]);
+    const denseQuery = async (): Promise<{ matches: VectorizeMatch[] }> => {
+      try {
+        return await env.VECTORIZE.query(values, { topK: vectorizeTopK, returnMetadata: "all" });
+      } catch (e) {
+        console.error("Vectorize query failed (degrading to keyword-only):", e);
+        semanticUnavailable = true;
+        return { matches: [] as VectorizeMatch[] };
+      }
+    };
+    const [denseResults, kwRows] = await Promise.all([denseQuery(), keywordSearch(tokens, env)]);
     results = denseResults;
     keywordRows = kwRows;
 
-    if (results.matches.length && results.matches[0].score < DUPLICATE_FLAG_THRESHOLD) {
-      results = await env.VECTORIZE.query(values, {
-        topK: 50,
-        returnMetadata: "all",
-      });
+    if (!semanticUnavailable && results.matches.length && results.matches[0].score < DUPLICATE_FLAG_THRESHOLD) {
+      try {
+        results = await env.VECTORIZE.query(values, { topK: 50, returnMetadata: "all" });
+      } catch (e) {
+        console.error("Vectorize widen-query failed (non-fatal):", e);
+        semanticUnavailable = true;
+      }
     }
   }
 
@@ -1765,7 +1782,7 @@ export async function recallEntries(
   // keyword is a re-ranking signal only (allowKeywordOnly=false); on the default path it can
   // also surface exact-identifier matches the dense top-K missed entirely.
   const fusedMatches = fuseDenseAndKeyword(results.matches as VectorizeMatch[], keywordRows, tokens, !tag);
-  if (!fusedMatches.length) return { matches: [], insight: "" };
+  if (!fusedMatches.length) return { matches: [], insight: "", semanticUnavailable };
 
   // Fetch recall_count and importance_score for all candidates to use in scoring.
   // The tag path can produce far more than 100 candidates, so chunk the IN query
@@ -1795,7 +1812,7 @@ export async function recallEntries(
     return true;
   }).slice(0, topK);
 
-  if (!deduped.length) return { matches: [], insight: "" };
+  if (!deduped.length) return { matches: [], insight: "", semanticUnavailable };
 
   const seedParentIds = deduped.map((m) => (m.metadata as any)?.parentId ?? m.id);
 
@@ -1903,7 +1920,7 @@ export async function recallEntries(
     );
   }
 
-  return { matches, insight };
+  return { matches, insight, semanticUnavailable };
 }
 
 // ─── Shared write path ────────────────────────────────────────────────────────
@@ -2327,13 +2344,17 @@ function buildMcpServer(env: Env, ctx: ExecutionContext): McpServer {
       },
     },
     async ({ query, topK, tag, after, before, kind, hops }) => {
-      const { matches, insight } = await recallEntries({ query, topK, tag, after, before, kind: kind as MemoryKind | undefined, hops }, env, ctx);
+      const { matches, insight, semanticUnavailable } = await recallEntries({ query, topK, tag, after, before, kind: kind as MemoryKind | undefined, hops }, env, ctx);
+
+      const notice = semanticUnavailable
+        ? "Note: semantic search is unavailable because the Vectorize index is missing, so these are keyword matches only. Fix: run `npx wrangler vectorize create second-brain-vectors --dimensions=384 --metric=cosine`, or grant the build token Vectorize Edit and redeploy.\n\n"
+        : "";
 
       if (!matches.length) {
-        return { content: [{ type: "text", text: "Nothing found matching that query." }] };
+        return { content: [{ type: "text", text: notice + "Nothing found matching that query." }] };
       }
 
-      return { content: [{ type: "text", text: renderRecallText(matches, insight) }] };
+      return { content: [{ type: "text", text: notice + renderRecallText(matches, insight) }] };
     }
   );
 
@@ -2724,10 +2745,17 @@ const defaultHandler = {
       const kind = kindParam && (KIND_VALUES as readonly string[]).includes(kindParam) ? kindParam as MemoryKind : undefined;
       const hops = Math.min(Math.max(parseInt(url.searchParams.get("hops") ?? "0", 10), 0), 3);
 
-      const { matches, insight } = await recallEntries({ query, topK, tag, after, before, kind, hops }, env, ctx);
+      const { matches, insight, semanticUnavailable } = await recallEntries({ query, topK, tag, after, before, kind, hops }, env, ctx);
 
       if (!matches.length) {
-        return json({ ok: true, results: [], message: "Nothing found matching that query." });
+        return json({
+          ok: true,
+          results: [],
+          semantic_unavailable: semanticUnavailable,
+          message: semanticUnavailable
+            ? "Semantic search unavailable (Vectorize index missing). Fix: run `npx wrangler vectorize create second-brain-vectors --dimensions=384 --metric=cosine`, or grant the build token Vectorize Edit and redeploy."
+            : "Nothing found matching that query.",
+        });
       }
 
       return json({
@@ -2743,6 +2771,7 @@ const defaultHandler = {
           hop: m.hop,
         })),
         insight: insight || null,
+        semantic_unavailable: semanticUnavailable,
       });
     }
 

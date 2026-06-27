@@ -571,3 +571,24 @@ describe("GET /recall", () => {
     expect(data.results[0].id).toBe("v19");
   });
 });
+
+describe("GET /recall — missing Vectorize index", () => {
+  it("degrades to keyword-only and flags semantic_unavailable", async () => {
+    const db = makeTestDb();
+    db.entries.push({
+      id: "k1", content: "pricing model decision notes", tags: "[]", source: "api",
+      created_at: Date.now(), vector_ids: "[]", recall_count: 0, importance_score: 0,
+    });
+    const env = makeTestEnv(db, {
+      VECTORIZE: makeVectorizeMock({ query: vi.fn().mockRejectedValue(new Error("index not found")) }),
+    });
+    const ctx = { waitUntil: (_: Promise<any>) => {} } as any;
+
+    const res = await worker.fetch(req("GET", "/recall?query=pricing"), env, ctx);
+    expect(res.status).toBe(200);
+    const data = await res.json() as any;
+    expect(data.ok).toBe(true);
+    expect(data.semantic_unavailable).toBe(true);
+    expect(data.results.some((r: any) => r.id === "k1")).toBe(true);
+  });
+});
