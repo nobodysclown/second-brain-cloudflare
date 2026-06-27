@@ -606,6 +606,40 @@ async function embed(text: string, env: Env): Promise<number[]> {
   return result.data[0] as number[];
 }
 
+// ─── Vectorize index health ───────────────────────────────────────────────────
+// Vectorize is the one resource Cloudflare cannot auto-provision at deploy time,
+// and the default one-click build token lacks permission to create it. When the
+// index is missing the Worker still runs (capture stays resilient), but semantic
+// recall is degraded. We detect that at runtime via the binding's describe()
+// (a capability-based call that works regardless of API token scopes) so the
+// dashboard and recall can report it. See docs/superpowers/specs/2026-06-26-*.
+
+export const VECTORIZE_INDEX_NAME = "second-brain-vectors";
+
+export interface VectorizeHealth {
+  ok: boolean;
+  indexName: string;
+  dimensions?: number;
+  error?: string;
+}
+
+export async function checkVectorizeHealth(env: Env): Promise<VectorizeHealth> {
+  try {
+    const info = (await env.VECTORIZE.describe()) as any;
+    return {
+      ok: true,
+      indexName: VECTORIZE_INDEX_NAME,
+      dimensions: info?.dimensions ?? info?.config?.dimensions,
+    };
+  } catch (e) {
+    return {
+      ok: false,
+      indexName: VECTORIZE_INDEX_NAME,
+      error: e instanceof Error ? e.message : String(e),
+    };
+  }
+}
+
 // ─── Database initialization ──────────────────────────────────────────────────
 
 async function initializeDatabase(env: Env): Promise<void> {
