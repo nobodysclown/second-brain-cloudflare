@@ -80,6 +80,9 @@ const DIGEST_MAX_TOKENS = 400;
 
 // ─── Vectorize constants ──────────────────────────────────────────────────────
 
+const VECTORIZE_FIX_HINT =
+  "run `npx wrangler vectorize create second-brain-vectors --dimensions=384 --metric=cosine`, or grant the build token Vectorize Edit and redeploy";
+
 const VECTORIZE_TOP_K_MULTIPLIER = 3;
 // getByIds batch size for tag-scoped recall — Vectorize rejects more than 20 IDs
 // per call (VECTOR_GET_ERROR, code 40007)
@@ -1781,7 +1784,7 @@ export async function recallEntries(
   // Always-on hybrid retrieval: fuse dense + keyword candidates via RRF. On the tag path
   // keyword is a re-ranking signal only (allowKeywordOnly=false); on the default path it can
   // also surface exact-identifier matches the dense top-K missed entirely.
-  const fusedMatches = fuseDenseAndKeyword(results.matches as VectorizeMatch[], keywordRows, tokens, !tag);
+  const fusedMatches = fuseDenseAndKeyword(results.matches as VectorizeMatch[], keywordRows, tokens, !tag || semanticUnavailable);
   if (!fusedMatches.length) return { matches: [], insight: "", semanticUnavailable };
 
   // Fetch recall_count and importance_score for all candidates to use in scoring.
@@ -2347,7 +2350,7 @@ function buildMcpServer(env: Env, ctx: ExecutionContext): McpServer {
       const { matches, insight, semanticUnavailable } = await recallEntries({ query, topK, tag, after, before, kind: kind as MemoryKind | undefined, hops }, env, ctx);
 
       const notice = semanticUnavailable
-        ? "Note: semantic search is unavailable because the Vectorize index is missing, so these are keyword matches only. Fix: run `npx wrangler vectorize create second-brain-vectors --dimensions=384 --metric=cosine`, or grant the build token Vectorize Edit and redeploy.\n\n"
+        ? `Note: semantic search is unavailable because the Vectorize index is missing, so these are keyword matches only. Fix: ${VECTORIZE_FIX_HINT}.\n\n`
         : "";
 
       if (!matches.length) {
@@ -2753,7 +2756,7 @@ const defaultHandler = {
           results: [],
           semantic_unavailable: semanticUnavailable,
           message: semanticUnavailable
-            ? "Semantic search unavailable (Vectorize index missing). Fix: run `npx wrangler vectorize create second-brain-vectors --dimensions=384 --metric=cosine`, or grant the build token Vectorize Edit and redeploy."
+            ? `Semantic search unavailable (Vectorize index missing). Fix: ${VECTORIZE_FIX_HINT}.`
             : "Nothing found matching that query.",
         });
       }
