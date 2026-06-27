@@ -94,7 +94,7 @@ Enter the following value during setup:
 | ---------- | ------------------------------- |
 | AUTH_TOKEN | The token you created in step 1 |
 
-Cloudflare will provision the required resources and deploy your Worker automatically. The Vectorize index is created for you during deployment with the correct settings (384 dimensions, cosine metric), so there is nothing else to fill in.
+Cloudflare will provision the required resources and deploy your Worker automatically. The Vectorize index (384 dimensions, cosine metric) is created during the build when the deploy has permission to do so. If semantic recall is not working afterward, see [Enable semantic search](#enable-semantic-search-vectorize-index).
 
 When deployment finishes, copy your Worker URL. It will look similar to:
 
@@ -155,6 +155,40 @@ A successful response will look like:
 ```json
 {"ok":true,"id":"..."}
 ```
+
+You can also check index health directly:
+
+```bash
+curl https://YOUR-WORKER-URL/health \
+  -H "Authorization: Bearer YOUR-TOKEN"
+```
+
+A healthy deployment returns `"ok": true` with `vectorize.ok` also `true`. If `vectorize.ok` is `false`, the index was not created during the build. See the next section.
+
+### Enable semantic search (Vectorize index)
+
+Vectorize is the one resource Cloudflare cannot auto-provision at deploy time, and the API token the one-click build uses does not include permission to create it by default. When that happens the deploy still succeeds and capture, listing, and keyword search keep working, but semantic recall is disabled until the index exists. The dashboard shows a warning bar and recall returns a notice when this is the case.
+
+Pick whichever fix suits you. Both are one-time.
+
+**Option A: one terminal command (fastest)**
+
+```bash
+npx wrangler vectorize create second-brain-vectors --dimensions=384 --metric=cosine
+```
+
+This is safe to run again; if the index already exists it is a no-op.
+
+**Option B: no terminal, from the Cloudflare dashboard**
+
+Cloudflare does not offer a button to create a Vectorize index directly, but you can give the build permission to create it for you:
+
+1. Open the Cloudflare dashboard and go to **My Profile**, then **API Tokens**.
+2. Find the token named for Workers Builds (auto-generated when you deployed) and choose **Edit**.
+3. Under **Permissions**, add: **Account**, **Vectorize**, **Edit**. Save the token.
+4. Redeploy: go to **Workers & Pages**, open your Worker, and trigger a new deployment (or push any commit to the connected repository). The build now creates the index automatically.
+
+After either option, reload the dashboard. The warning bar disappears once the index exists, and semantic recall starts working.
 
 <details>
 <summary><strong>How OAuth authentication works</strong></summary>
