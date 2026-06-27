@@ -609,4 +609,22 @@ describe("GET /recall — missing Vectorize index", () => {
     expect(data.semantic_unavailable).toBe(true);
     expect(data.results.some((r: any) => r.id === "t1")).toBe(true);
   });
+
+  it("does NOT flag semantic_unavailable when only the widen-query fails", async () => {
+    const db = makeTestDb();
+    db.entries.push({
+      id: "w1", content: "widen path content", tags: "[]", source: "api",
+      created_at: Date.now(), vector_ids: '["w1"]', recall_count: 0, importance_score: 0,
+    });
+    const query = vi.fn()
+      .mockResolvedValueOnce({ matches: [{ id: "w1", score: 0.1, metadata: { parentId: "w1", content: "widen path content", created_at: Date.now(), tags: [], source: "api" } }] })
+      .mockRejectedValueOnce(new Error("widen failed"));
+    const env = makeTestEnv(db, { VECTORIZE: makeVectorizeMock({ query }) });
+    const ctx = { waitUntil: (_: Promise<any>) => {} } as any;
+    const res = await worker.fetch(req("GET", "/recall?query=widen"), env, ctx);
+    expect(res.status).toBe(200);
+    const data = await res.json() as any;
+    expect(data.semantic_unavailable).toBe(false);
+    expect(query).toHaveBeenCalledTimes(2);
+  });
 });

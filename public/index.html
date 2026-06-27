@@ -2739,6 +2739,7 @@
         let el = document.getElementById('vectorize-banner')
         if (!banner) {
           if (el) el.remove()
+          document.body.style.paddingTop = ''
           return
         }
         if (!el) {
@@ -2753,6 +2754,7 @@
           '<p style="margin:6px 0 2px">Run this once in your terminal:</p>' +
           '<pre style="white-space:pre-wrap;background:rgba(0,0,0,0.25);padding:8px;border-radius:6px;margin:0">' + escHtml(banner.command) + '</pre>' +
           '<p style="margin:6px 0 0">' + escHtml(banner.gui) + '</p></details>'
+        document.body.style.paddingTop = el.offsetHeight + 'px'
       }
 
       async function apiMcp(toolName, args) {

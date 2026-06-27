@@ -1762,6 +1762,9 @@ export async function recallEntries(
       try {
         return await env.VECTORIZE.query(values, { topK: vectorizeTopK, returnMetadata: "all" });
       } catch (e) {
+        // This is the authoritative signal that the Vectorize index is unreachable —
+        // semanticUnavailable drives the dashboard banner (checkVectorizeHealth/GET /health
+        // is the full health probe; this catch fires only when the query itself throws).
         console.error("Vectorize query failed (degrading to keyword-only):", e);
         semanticUnavailable = true;
         return { matches: [] as VectorizeMatch[] };
@@ -1775,8 +1778,9 @@ export async function recallEntries(
       try {
         results = await env.VECTORIZE.query(values, { topK: 50, returnMetadata: "all" });
       } catch (e) {
-        console.error("Vectorize widen-query failed (non-fatal):", e);
-        semanticUnavailable = true;
+        // Narrow query already succeeded with real matches, so the index works.
+        // A transient widen failure must not claim semantic search is unavailable.
+        console.error("Vectorize widen-query failed (non-fatal, keeping narrow results):", e);
       }
     }
   }
