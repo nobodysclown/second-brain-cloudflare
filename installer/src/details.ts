@@ -46,8 +46,35 @@ async function boot() {
           "it will ask for your password the first time.",
       ]),
       toolRows(details, tools),
+      logoutSection(),
     ]),
   );
+}
+
+function logoutSection(): HTMLElement {
+  const container = h("div", { class: "logout-section" });
+  const render = (confirming: boolean) => {
+    if (!confirming) {
+      const logout = h("button", { class: "btn-danger" }, ["Log out of this computer"]);
+      logout.addEventListener("click", () => render(true));
+      container.replaceChildren(logout);
+      return;
+    }
+    const confirm = h("button", { class: "btn-danger" }, ["Yes, log out"]);
+    confirm.addEventListener("click", () => void invoke("logout"));
+    const keep = h("button", { class: "btn-ghost" }, ["Keep me signed in"]);
+    keep.addEventListener("click", () => render(false));
+    container.replaceChildren(
+      h("div", { class: "url-desc" }, [
+        "Your Second Brain and all its memories stay safe — this only forgets " +
+          "the connection on this computer. You can reconnect anytime with " +
+          "your address and password.",
+      ]),
+      h("div", { class: "row-actions" }, [confirm, keep]),
+    );
+  };
+  render(false);
+  return container;
 }
 
 void boot();

@@ -15,7 +15,35 @@ mod worker_bundle;
 use commands::SetupSession;
 use tauri::menu::{Menu, MenuBuilder, MenuItem, SubmenuBuilder};
 use tauri::tray::TrayIconBuilder;
-use tauri::Manager;
+use tauri::{AppHandle, Manager};
+use tauri_plugin_dialog::{DialogExt, MessageDialogButtons, MessageDialogKind};
+
+/// Menu-bar Logout: confirm natively, then clear this computer's connection.
+/// (The details window has its own inline confirm and calls the command.)
+fn confirm_logout(app: &AppHandle) {
+    if secure_store::load_setup().is_none() {
+        // Nothing to log out of — just make sure setup is visible.
+        let _ = windows::open_setup_window(app);
+        return;
+    }
+    let handle = app.clone();
+    app.dialog()
+        .message(
+            "Log out of this computer?\n\nYour Second Brain and all its memories stay safe. \
+             You can reconnect anytime with your address and password.",
+        )
+        .title("Log out")
+        .kind(MessageDialogKind::Warning)
+        .buttons(MessageDialogButtons::OkCancelCustom(
+            "Log out".to_string(),
+            "Cancel".to_string(),
+        ))
+        .show(move |confirmed| {
+            if confirmed {
+                commands::perform_logout(&handle);
+            }
+        });
+}
 
 pub fn run() {
     let dry_run = std::env::var("SECOND_BRAIN_DRY_RUN").is_ok();
@@ -33,6 +61,7 @@ pub fn run() {
         .plugin(tauri_plugin_window_state::Builder::default().build())
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_clipboard_manager::init())
+        .plugin(tauri_plugin_dialog::init())
         .manage(SetupSession::new(dry_run))
         .invoke_handler(tauri::generate_handler![
             commands::get_app_state,
@@ -47,6 +76,7 @@ pub fn run() {
             commands::open_external,
             commands::open_dashboard,
             commands::open_details_window,
+            commands::logout,
         ])
         .setup(move |app| {
             let handle = app.handle().clone();
@@ -60,16 +90,20 @@ pub fn run() {
                 true,
                 Some("CmdOrCtrl+D"),
             )?;
+            let logout_item =
+                MenuItem::with_id(app, "menu-logout", "Log out…", true, None::<&str>)?;
             let menu = Menu::default(&handle)?;
             let connections = SubmenuBuilder::new(app, "Connections")
                 .item(&details_item)
+                .separator()
+                .item(&logout_item)
                 .build()?;
             menu.append(&connections)?;
             app.set_menu(menu)?;
-            app.on_menu_event(|app, event| {
-                if event.id().as_ref() == "menu-details" {
-                    windows::open_details_window(app);
-                }
+            app.on_menu_event(|app, event| match event.id().as_ref() {
+                "menu-details" => windows::open_details_window(app),
+                "menu-logout" => confirm_logout(app),
+                _ => {}
             });
 
             // Tray: quick access to the dashboard and connection details.

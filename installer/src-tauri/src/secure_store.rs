@@ -86,7 +86,6 @@ pub fn load_setup() -> Option<SetupInfo> {
     })
 }
 
-#[allow(dead_code)] // reset path for support/testing; not wired to UI yet
 pub fn clear_setup() {
     backend::delete(KEY_WORKER_URL);
     backend::delete(KEY_AUTH_TOKEN);

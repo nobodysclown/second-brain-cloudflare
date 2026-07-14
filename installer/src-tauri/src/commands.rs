@@ -34,6 +34,13 @@ impl SetupSession {
             outcome: Mutex::new(None),
         }
     }
+
+    fn reset(&self) {
+        *self.password.lock().unwrap() = None;
+        *self.tokens.lock().unwrap() = None;
+        self.accounts.lock().unwrap().clear();
+        *self.outcome.lock().unwrap() = None;
+    }
 }
 
 const MIN_PASSWORD_LEN: usize = 12;
@@ -372,6 +379,34 @@ pub fn open_dashboard(app: AppHandle, session: State<'_, SetupSession>) -> Resul
 #[tauri::command]
 pub fn open_details_window(app: AppHandle) {
     windows::open_details_window(&app);
+}
+
+/// Signs this computer out: forgets the saved address + password and returns
+/// to the setup flow. The Second Brain itself (and every other device) is
+/// untouched. Confirmation happens in the UI before this is invoked.
+#[tauri::command]
+pub fn logout(app: AppHandle, session: State<'_, SetupSession>) {
+    session.reset();
+    perform_logout(&app);
+}
+
+/// Shared by the `logout` command and the app-menu item (which confirms via a
+/// native dialog and has no `State` handle).
+pub fn perform_logout(app: &AppHandle) {
+    secure_store::clear_setup();
+    if let Some(session) = app.try_state::<SetupSession>() {
+        session.reset();
+    }
+    // The wrapper injected the dashboard session into the webview's
+    // localStorage — wipe that store too, then close wrapper windows.
+    if let Some(w) = app.get_webview_window("brain") {
+        let _ = w.clear_all_browsing_data();
+        let _ = w.close();
+    }
+    if let Some(w) = app.get_webview_window("details") {
+        let _ = w.close();
+    }
+    let _ = windows::open_setup_window(app);
 }
 
 #[cfg(test)]
