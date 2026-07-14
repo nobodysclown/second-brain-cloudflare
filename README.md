@@ -77,7 +77,11 @@ Memory is most useful when capturing information is easy. Second Brain connects 
 
 ## Quick Start
 
-Set up your Second Brain in three steps.
+### One-click desktop setup (no technical steps)
+
+Prefer to skip the terminal entirely? **[Download the Second Brain desktop app](../../releases/latest)** for Mac or Windows. It walks you through setup in about two minutes — you pick a password, sign in to (or create) a free Cloudflare account, and it builds your Second Brain in your own private space, connects your AI tools, and then becomes the app you open your dashboard with every day. Developers: see [`installer/`](installer/) for how it works and how to build it.
+
+Or set up manually in three steps:
 
 ### 1. Choose an authentication token
 
