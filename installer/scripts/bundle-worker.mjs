@@ -123,7 +123,15 @@ const nodeCompatPlugin = {
 };
 
 await build({
-  entryPoints: [resolve(repoRoot, wrangler.main)],
+  // Facade entry (like wrangler's): the Worker source exports test-only
+  // constants alongside the handler, and workerd rejects non-handler named
+  // exports on the main module — re-export only the default handler.
+  stdin: {
+    contents: `import worker from ${JSON.stringify("./" + wrangler.main)};\nexport default worker;`,
+    resolveDir: repoRoot,
+    loader: "js",
+    sourcefile: "entry-facade.js",
+  },
   bundle: true,
   format: "esm",
   platform: "browser",
@@ -131,7 +139,9 @@ await build({
   external: ["node:*", "cloudflare:*"],
   plugins: [nodeCompatPlugin],
   banner: {
-    js: 'import { createRequire as __sbCreateRequire } from "node:module";\nconst require = __sbCreateRequire(import.meta.url);',
+    // workerd has no import.meta.url; wrangler's own nodejs_compat shim also
+    // anchors createRequire at "/".
+    js: 'import { createRequire as __sbCreateRequire } from "node:module";\nconst require = __sbCreateRequire("/");',
   },
   keepNames: true,
   outfile: resolve(outDir, "worker.js"),
