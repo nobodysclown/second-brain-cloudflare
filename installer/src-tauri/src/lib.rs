@@ -38,6 +38,7 @@ pub fn run() {
             commands::get_app_state,
             commands::submit_password,
             commands::connect_cloudflare,
+            commands::connect_existing,
             commands::start_provisioning,
             commands::get_connection_details,
             commands::detect_tools,

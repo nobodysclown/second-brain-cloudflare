@@ -205,6 +205,81 @@ pub async fn start_provisioning(
     Ok(outcome)
 }
 
+/// Turns whatever the user pasted into a canonical `https://host` origin:
+/// tolerates a missing scheme, trailing slashes, and pasted sub-paths
+/// (e.g. their /mcp connector link or a dashboard page).
+fn normalize_worker_url(input: &str) -> Result<String, String> {
+    const BAD: &str = "That doesn't look like a web address. It usually ends in .workers.dev.";
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return Err(BAD.into());
+    }
+    let with_scheme = if trimmed.contains("://") {
+        trimmed.to_string()
+    } else {
+        format!("https://{trimmed}")
+    };
+    let parsed = url::Url::parse(&with_scheme).map_err(|_| BAD.to_string())?;
+    if parsed.scheme() != "https" && parsed.scheme() != "http" {
+        return Err(BAD.into());
+    }
+    // No legitimate Worker address carries credentials — this also catches
+    // scheme-ish junk like "mailto:a@b.c" being read as user@host.
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err(BAD.into());
+    }
+    let host = parsed.host_str().ok_or(BAD)?;
+    let origin = match parsed.port() {
+        Some(port) => format!("{}://{host}:{port}", parsed.scheme()),
+        None => format!("{}://{host}", parsed.scheme()),
+    };
+    Ok(origin)
+}
+
+/// The "Already have a Second Brain?" path: validate the address + password
+/// against the live Worker, then save them — no Cloudflare sign-in, no
+/// provisioning, nothing in the user's account is touched.
+#[tauri::command]
+pub async fn connect_existing(
+    address: String,
+    password: String,
+    session: State<'_, SetupSession>,
+) -> Result<ProvisionOutcome, String> {
+    let worker_url = normalize_worker_url(&address)?;
+    let password = password.trim().to_string();
+    if password.is_empty() {
+        return Err("Enter the password you chose when you set it up.".into());
+    }
+
+    if !session.dry_run {
+        use crate::cf::api::{probe_worker, WorkerProbe};
+        match probe_worker(&worker_url, &password).await {
+            Ok(WorkerProbe::Valid) => {}
+            Ok(WorkerProbe::WrongPassword) => {
+                return Err("That password doesn't match this Second Brain. Check it and try again.".into())
+            }
+            Ok(WorkerProbe::NotABrain) => {
+                return Err("We couldn't find a Second Brain at that address. Double-check the link — it usually ends in .workers.dev.".into())
+            }
+            Err(e) => {
+                log::warn!("existing-brain probe failed: {e}");
+                return Err("We couldn't reach that address. Check it and your internet connection, then try again.".into());
+            }
+        }
+        secure_store::save_setup(&worker_url, &password).map_err(|e| {
+            log::error!("secure store save failed: {e}");
+            "Connected, but we couldn't save your details to this device's secure storage.".to_string()
+        })?;
+    }
+
+    let outcome = ProvisionOutcome {
+        mcp_url: format!("{worker_url}/mcp"),
+        worker_url,
+    };
+    *session.outcome.lock().unwrap() = Some(outcome.clone());
+    Ok(outcome)
+}
+
 fn details_from_anywhere(session: &SetupSession) -> Option<ProvisionOutcome> {
     if let Some(outcome) = session.outcome.lock().unwrap().clone() {
         return Some(outcome);
@@ -297,4 +372,41 @@ pub fn open_dashboard(app: AppHandle, session: State<'_, SetupSession>) -> Resul
 #[tauri::command]
 pub fn open_details_window(app: AppHandle) {
     windows::open_details_window(&app);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::normalize_worker_url;
+
+    #[test]
+    fn normalizes_pasted_addresses() {
+        for input in [
+            "https://second-brain.demo.workers.dev",
+            "second-brain.demo.workers.dev",
+            "https://second-brain.demo.workers.dev/",
+            "  second-brain.demo.workers.dev/mcp  ",
+            "https://second-brain.demo.workers.dev/graph?tab=all",
+        ] {
+            assert_eq!(
+                normalize_worker_url(input).unwrap(),
+                "https://second-brain.demo.workers.dev",
+                "input: {input:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn keeps_explicit_http_and_ports_for_dev_setups() {
+        assert_eq!(
+            normalize_worker_url("http://localhost:8787/mcp").unwrap(),
+            "http://localhost:8787"
+        );
+    }
+
+    #[test]
+    fn rejects_junk() {
+        for input in ["", "   ", "not a url at all!", "ftp://x.dev", "mailto:a@b.c"] {
+            assert!(normalize_worker_url(input).is_err(), "input: {input:?}");
+        }
+    }
 }

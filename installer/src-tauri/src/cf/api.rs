@@ -324,6 +324,43 @@ impl CfClient {
 
 // ── Worker smoke tests (talk to the deployed Worker, not the CF API) ─────────
 
+/// Outcome of probing an address the user claims is an existing Second Brain.
+#[derive(Debug, PartialEq, Eq)]
+pub enum WorkerProbe {
+    /// Authenticated and answered like a Second Brain (even if its vector
+    /// index is degraded — the dashboard surfaces that itself).
+    Valid,
+    WrongPassword,
+    /// Reached something, but it doesn't speak the Second Brain health
+    /// contract — almost certainly the wrong address.
+    NotABrain,
+}
+
+/// GET /health against a user-supplied address, for the "connect an existing
+/// Second Brain" path. Unlike [`worker_health_ok`], a degraded index still
+/// counts as valid: the brain exists and the password is right.
+pub async fn probe_worker(worker_url: &str, auth_token: &str) -> Result<WorkerProbe, CfApiError> {
+    let http = reqwest::Client::new();
+    let resp = http
+        .get(format!("{worker_url}/health"))
+        .bearer_auth(auth_token)
+        .timeout(Duration::from_secs(20))
+        .send()
+        .await?;
+    if resp.status().as_u16() == 401 {
+        return Ok(WorkerProbe::WrongPassword);
+    }
+    if !resp.status().is_success() {
+        return Ok(WorkerProbe::NotABrain);
+    }
+    let body: serde_json::Value = resp.json().await.unwrap_or(serde_json::Value::Null);
+    if body.get("vectorize").is_some() {
+        Ok(WorkerProbe::Valid)
+    } else {
+        Ok(WorkerProbe::NotABrain)
+    }
+}
+
 /// GET /health — passes only when the Worker is live AND its vector index is
 /// wired (`ok && vectorize.ok`), per the Worker's own health contract.
 pub async fn worker_health_ok(worker_url: &str, auth_token: &str) -> Result<bool, CfApiError> {
@@ -428,6 +465,42 @@ mod tests {
         let res: Option<KvNamespace> = client.send(|h| h.get(&url)).await.unwrap();
         assert_eq!(res.unwrap().id, "kv1");
         assert_eq!(hits.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn probe_worker_classifies_responses() {
+        // One tiny server; the path selects the scenario.
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let port = server.server_addr().to_ip().unwrap().port();
+        std::thread::spawn(move || {
+            loop {
+                let Ok(req) = server.recv() else { return };
+                let (status, body) = match req.url() {
+                    u if u.starts_with("/valid") => {
+                        (200, r#"{"ok":false,"vectorize":{"ok":false,"indexName":"second-brain-vectors"}}"#)
+                    }
+                    u if u.starts_with("/wrongpw") => (401, r#"{"ok":false,"error":"Unauthorized"}"#),
+                    _ => (200, r#"<html>welcome to my blog</html>"#),
+                };
+                let _ = req.respond(tiny_http::Response::from_string(body).with_status_code(status));
+            }
+        });
+        let base = format!("http://127.0.0.1:{port}");
+
+        // Degraded index still authenticates ⇒ Valid.
+        assert_eq!(
+            probe_worker(&format!("{base}/valid"), "pw").await.unwrap(),
+            WorkerProbe::Valid
+        );
+        assert_eq!(
+            probe_worker(&format!("{base}/wrongpw"), "pw").await.unwrap(),
+            WorkerProbe::WrongPassword
+        );
+        assert_eq!(
+            probe_worker(&format!("{base}/blog"), "pw").await.unwrap(),
+            WorkerProbe::NotABrain
+        );
+        assert!(probe_worker("http://127.0.0.1:1/nothing", "pw").await.is_err());
     }
 
     #[tokio::test]

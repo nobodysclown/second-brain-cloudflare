@@ -43,6 +43,10 @@ function brand(): HTMLElement {
 function welcomeScreen() {
   const start = h("button", { class: "btn-primary" }, ["Get started"]);
   start.addEventListener("click", passwordScreen);
+  const existing = h("button", { class: "btn-ghost", style: "width:100%;margin-top:8px" }, [
+    "Already have a Second Brain?",
+  ]);
+  existing.addEventListener("click", () => connectExistingScreen());
   show(
     brand(),
     h("h1", {}, ["Let's set up your Second Brain"]),
@@ -52,8 +56,63 @@ function welcomeScreen() {
         "and nothing technical is required.",
     ]),
     start,
+    existing,
     h("p", { class: "footnote" }, ["Free to run · Your data stays yours"]),
   );
+}
+
+// ── Connect an existing Second Brain (new computer / set up elsewhere) ────────
+
+function connectExistingScreen(errorMsg?: string, prefillAddress?: string) {
+  const address = h("input", {
+    type: "text",
+    placeholder: "Your Second Brain address (…workers.dev)",
+    autocapitalize: "off",
+    autocorrect: "off",
+    spellcheck: "false",
+  });
+  if (prefillAddress) address.value = prefillAddress;
+  const password = h("input", { type: "password", placeholder: "Your password" });
+  const error = errorMsg
+    ? h("div", { class: "notice error" }, ["⚠️", h("span", {}, [errorMsg])])
+    : "";
+  const connect = h("button", { class: "btn-primary" }, ["Connect"]);
+  const back = h("button", { class: "btn-ghost", style: "width:100%;margin-top:8px" }, [
+    "Back",
+  ]);
+  back.addEventListener("click", welcomeScreen);
+
+  connect.addEventListener("click", async () => {
+    connect.disabled = true;
+    connect.textContent = "Checking…";
+    try {
+      details = await invoke<ConnectionDetails>("connect_existing", {
+        address: address.value,
+        password: password.value,
+      });
+      await toolsScreen();
+    } catch (e) {
+      connectExistingScreen(String(e), address.value);
+    }
+  });
+
+  show(
+    brand(),
+    h("h1", {}, ["Connect your Second Brain"]),
+    h("p", { class: "lede" }, [
+      "Setting up a new computer? Enter the address and password of the " +
+        "Second Brain you already have — nothing will be changed or reset.",
+    ]),
+    error,
+    h("div", { class: "field-stack" }, [address, password]),
+    connect,
+    back,
+    h("p", { class: "footnote" }, [
+      "The address is in Connection details on your other computer, " +
+        "or in the confirmation email you sent yourself.",
+    ]),
+  );
+  address.focus();
 }
 
 // ── Screen 2: Password ────────────────────────────────────────────────────────
