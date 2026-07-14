@@ -336,29 +336,34 @@ pub enum WorkerProbe {
     NotABrain,
 }
 
-/// GET /health against a user-supplied address, for the "connect an existing
-/// Second Brain" path. Unlike [`worker_health_ok`], a degraded index still
-/// counts as valid: the brain exists and the password is right.
+/// Validates a user-supplied address for the "connect an existing Second
+/// Brain" path. Unlike [`worker_health_ok`], a degraded index still counts as
+/// valid: the brain exists and the password is right.
+///
+/// Tries `/health` first, but falls back to `/count` for brains deployed
+/// before the `/health` endpoint existed — those return 404 there, while
+/// `/count` has been an auth-gated JSON route since the earliest versions.
 pub async fn probe_worker(worker_url: &str, auth_token: &str) -> Result<WorkerProbe, CfApiError> {
     let http = reqwest::Client::new();
-    let resp = http
-        .get(format!("{worker_url}/health"))
-        .bearer_auth(auth_token)
-        .timeout(Duration::from_secs(20))
-        .send()
-        .await?;
-    if resp.status().as_u16() == 401 {
-        return Ok(WorkerProbe::WrongPassword);
+    for (path, expected_key) in [("/health", "vectorize"), ("/count", "count")] {
+        let resp = http
+            .get(format!("{worker_url}{path}"))
+            .bearer_auth(auth_token)
+            .timeout(Duration::from_secs(20))
+            .send()
+            .await?;
+        if resp.status().as_u16() == 401 {
+            return Ok(WorkerProbe::WrongPassword);
+        }
+        if !resp.status().is_success() {
+            continue; // e.g. 404 from an older Worker — try the next probe
+        }
+        let body: serde_json::Value = resp.json().await.unwrap_or(serde_json::Value::Null);
+        if body.get(expected_key).is_some() {
+            return Ok(WorkerProbe::Valid);
+        }
     }
-    if !resp.status().is_success() {
-        return Ok(WorkerProbe::NotABrain);
-    }
-    let body: serde_json::Value = resp.json().await.unwrap_or(serde_json::Value::Null);
-    if body.get("vectorize").is_some() {
-        Ok(WorkerProbe::Valid)
-    } else {
-        Ok(WorkerProbe::NotABrain)
-    }
+    Ok(WorkerProbe::NotABrain)
 }
 
 /// GET /health — passes only when the Worker is live AND its vector index is
@@ -480,6 +485,12 @@ mod tests {
                         (200, r#"{"ok":false,"vectorize":{"ok":false,"indexName":"second-brain-vectors"}}"#)
                     }
                     u if u.starts_with("/wrongpw") => (401, r#"{"ok":false,"error":"Unauthorized"}"#),
+                    // Pre-/health Worker: 404 there, but /count answers.
+                    u if u.starts_with("/old/health") => (404, "Not found"),
+                    u if u.starts_with("/old/count") => (200, r#"{"count":42}"#),
+                    // Pre-/health Worker + wrong password: 404 then 401.
+                    u if u.starts_with("/oldpw/health") => (404, "Not found"),
+                    u if u.starts_with("/oldpw/count") => (401, r#"{"ok":false,"error":"Unauthorized"}"#),
                     _ => (200, r#"<html>welcome to my blog</html>"#),
                 };
                 let _ = req.respond(tiny_http::Response::from_string(body).with_status_code(status));
@@ -494,6 +505,15 @@ mod tests {
         );
         assert_eq!(
             probe_worker(&format!("{base}/wrongpw"), "pw").await.unwrap(),
+            WorkerProbe::WrongPassword
+        );
+        // Older deployment without /health falls back to /count.
+        assert_eq!(
+            probe_worker(&format!("{base}/old"), "pw").await.unwrap(),
+            WorkerProbe::Valid
+        );
+        assert_eq!(
+            probe_worker(&format!("{base}/oldpw"), "pw").await.unwrap(),
             WorkerProbe::WrongPassword
         );
         assert_eq!(
