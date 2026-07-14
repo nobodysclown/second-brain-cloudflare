@@ -100,6 +100,7 @@ Tauri's bundler imports the certificate into a temporary keychain, signs, notari
 
 Choose one:
 
+- **SignPath Foundation (free for open source)** — the route this project is pursuing: [signpath.org](https://signpath.org) signs qualifying OSS projects at no cost. Prerequisites live in the root README's "Code signing policy" section; once the application is approved, the Windows job switches to their [GitHub Action](https://github.com/SignPath/github-action-submit-signing-request) (build unsigned → submit → manually approve in the SignPath dashboard → attach the signed installer). Note the signature carries SignPath Foundation's certificate, not your own identity.
 - **OV (Organization Validation)** — cheaper and file-based, works on hosted runners as-is. Downside: SmartScreen keeps warning users until the binary earns download reputation, which takes time. Acceptable to start.
 - **EV (Extended Validation)** — clears SmartScreen immediately (best for this audience), but the private key must live on a FIPS hardware token or cloud HSM. A hardware token **cannot** be plugged into GitHub's hosted runners — you need either a cloud-signing service (e.g. Azure Artifact Signing, SSL.com eSigner, DigiCert KeyLocker — anything with a CI-callable API) wired in through `bundle.windows.signCommand` in `tauri.conf.json`, or a self-hosted runner with the token attached.
 

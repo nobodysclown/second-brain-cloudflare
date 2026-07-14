@@ -261,6 +261,24 @@ It runs within Cloudflare's free tier at personal scale.
 
 Your data stays in your own Cloudflare account.
 
+## Code signing policy
+
+Windows builds of the [Second Brain desktop app](installer/) are code-signed.
+
+Free code signing provided by [SignPath.io](https://signpath.io), certificate by [SignPath Foundation](https://signpath.org).
+
+**Team and roles:**
+
+| Role | Members |
+| --- | --- |
+| Authors | [Rahil P (@rahilp)](https://github.com/rahilp) |
+| Reviewers | [Rahil P (@rahilp)](https://github.com/rahilp) |
+| Approvers | [Rahil P (@rahilp)](https://github.com/rahilp) |
+
+All release binaries are built from this repository's source by GitHub Actions ([installer-release.yml](.github/workflows/installer-release.yml)). Every signing request is reviewed and manually approved by an approver before a signed release is published.
+
+**Privacy statement:** This program will not transfer any information to other networked systems unless specifically requested by the user or the person installing or operating it. Second Brain is self-hosted by design: during setup the desktop app talks to Cloudflare only to create resources inside *your own* Cloudflare account, and afterwards it communicates exclusively with your own private Second Brain. Your memories and credentials are never sent to the project maintainers or any other third party.
+
 ## Star History
 
 <a href="https://www.star-history.com/?repos=rahilp%2Fsecond-brain-cloudflare&type=date&legend=top-left">
