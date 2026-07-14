@@ -140,11 +140,16 @@ jobs:
         if: matrix.platform == 'windows-latest' && env.WIN_SIGNED == '1'
         shell: pwsh
         run: |
-          $installer = Get-ChildItem -Path "src-tauri\target\release\bundle\nsis\*.exe" | Select-Object -First 1
-          Write-Host "Verifying $($installer.FullName)"
           # signtool lives in the Windows SDK on hosted runners.
           $signtool = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin\**\x64\signtool.exe" -Recurse | Select-Object -Last 1
-          & $signtool.FullName verify /pa /v $installer.FullName
+          $artifacts = @(Get-ChildItem "src-tauri\target\release\bundle\nsis\*.exe" -ErrorAction SilentlyContinue) +
+                       @(Get-ChildItem "src-tauri\target\release\bundle\msi\*.msi" -ErrorAction SilentlyContinue)
+          if ($artifacts.Count -eq 0) { throw "no Windows installers found to verify" }
+          foreach ($a in $artifacts) {
+            Write-Host "Verifying $($a.FullName)"
+            & $signtool.FullName verify /pa /v $a.FullName
+            if ($LASTEXITCODE -ne 0) { throw "signature verification failed for $($a.Name)" }
+          }
 
   # The release stays a draft until BOTH platforms built and verified, so a
   # published release never contains just one OS.
