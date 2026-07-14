@@ -121,7 +121,11 @@ For the EV/cloud route: skip those two secrets, store the provider's API credent
 
 ### Cut a release
 
+The version does **not** auto-increment. Bump it first in `src-tauri/tauri.conf.json` (`"version"`) — that value names the artifacts (`Second Brain_X.Y.Z_….dmg`) and fills the release title. Keep `src-tauri/Cargo.toml` and `package.json` in step with it for tidiness (they don't drive the release, but drift is confusing). Then commit, and tag **matching that version** — the tag itself is what triggers the workflow, and a tag that disagrees with the config produces a release whose title and filenames don't match its tag:
+
 ```bash
+# 1. bump "version" in src-tauri/tauri.conf.json (+ Cargo.toml, package.json)
+# 2. commit, then:
 git tag installer-v0.1.0
 git push origin installer-v0.1.0
 ```
